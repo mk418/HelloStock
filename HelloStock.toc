@@ -4,10 +4,13 @@
 ## Author: Drikk
 ## Version: @project-version@
 ## SavedVariables: HelloStockDB
+## SavedVariablesPerCharacter: HelloStockCharDB
 ## X-Curse-Project-ID: 1540866
 
-Defaults.lua
+Items.lua
 Comm.lua
 Core.lua
+Tooltip.lua
 UI.lua
+Minimap.lua
 Options.lua

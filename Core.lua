@@ -39,16 +39,330 @@ local trackedItems = nil
 local function TrackedItemSet()
   if trackedItems then return trackedItems end
   trackedItems = {}
-  if addon.DEFAULT_ITEMS then
-    for _, section in pairs(addon.DEFAULT_ITEMS) do
+  if addon.ITEMS then
+    for _, section in pairs(addon.ITEMS) do
       for _, group in ipairs(section) do
         for _, item in ipairs(group.items) do
-          trackedItems[item.id] = true
+          if item.id then trackedItems[item.id] = true end
         end
       end
     end
   end
   return trackedItems
+end
+
+function addon:IsTracked(itemID)
+  return itemID and TrackedItemSet()[itemID] == true
+end
+
+-- Returns true if the item is Binds-on-Pickup. Auto-detected via GetItemInfo's
+-- bindType field (1=BoP, 2=BoE, 3=BoU, 4=quest). Only BoP matters for our
+-- stockpile case — BoE/BoU consumables can still be traded until used. Items
+-- not yet in the client cache return false; PrimeItemCache on PLAYER_LOGIN
+-- populates the cache for everything in addon.ITEMS up front.
+function addon:IsBoP(itemID)
+  if not itemID then return false end
+  local _, _, _, _, _, _, _, _, _, _, _, _, _, bindType = GetItemInfo(itemID)
+  return bindType == 1
+end
+
+-- Recipe lookups, built lazily from addon.ITEMS the first time anything asks.
+-- recipeMap[buffID]   -> array of { id = ingredientID, count = N }
+-- usedInMap[reagentID] -> array of buffIDs
+local recipeMap, usedInMap
+local function BuildRecipeMaps()
+  if recipeMap then return end
+  recipeMap, usedInMap = {}, {}
+  if not addon.ITEMS then return end
+  for _, section in pairs(addon.ITEMS) do
+    for _, group in ipairs(section) do
+      for _, item in ipairs(group.items) do
+        if item.id and item.recipe then
+          recipeMap[item.id] = item.recipe
+          for _, ing in ipairs(item.recipe) do
+            usedInMap[ing.id] = usedInMap[ing.id] or {}
+            usedInMap[ing.id][#usedInMap[ing.id] + 1] = item.id
+          end
+        end
+      end
+    end
+  end
+end
+
+function addon:GetRecipe(itemID)
+  BuildRecipeMaps()
+  return recipeMap[itemID]
+end
+
+function addon:GetUsedIn(itemID)
+  BuildRecipeMaps()
+  return usedInMap[itemID]
+end
+
+-- itemID -> category name (the group it belongs to in Items.lua).
+local categoryMap
+local function BuildCategoryMap()
+  if categoryMap then return end
+  categoryMap = {}
+  if not addon.ITEMS then return end
+  for _, section in pairs(addon.ITEMS) do
+    for _, group in ipairs(section) do
+      for _, item in ipairs(group.items) do
+        if item.id then categoryMap[item.id] = group.category end
+      end
+    end
+  end
+end
+
+function addon:GetItemCategory(itemID)
+  BuildCategoryMap()
+  return categoryMap[itemID]
+end
+
+-- itemID -> roundUpTo (gather list rounds an item's deficit up to this step).
+-- Used e.g. for E'kos that can only be turned in in groups of 3.
+local roundUpMap
+local function BuildRoundUpMap()
+  if roundUpMap then return end
+  roundUpMap = {}
+  if not addon.ITEMS then return end
+  for _, section in pairs(addon.ITEMS) do
+    for _, group in ipairs(section) do
+      for _, item in ipairs(group.items) do
+        if item.id and item.roundUpTo and item.roundUpTo > 1 then
+          roundUpMap[item.id] = item.roundUpTo
+        end
+      end
+    end
+  end
+end
+
+-- Compute what raw materials the user needs to gather to bring every targeted
+-- item up to its target. Supports multi-level recipes (e.g. Flask of the Titans
+-- needs Stonescale Oil which itself has a recipe) by:
+--   1. Seeding `demand[id]` with every target's amount (no stock subtraction).
+--   2. Topologically sorting items with recipes so consumers are processed
+--      before their ingredients.
+--   3. For each recipe item in that order, computing `net = max(0, demand − have)`
+--      and propagating `net × ingredient.count` into each ingredient's demand.
+--   4. Emitting a gather entry for every leaf (no-recipe) item whose demand
+--      exceeds current stock.
+-- The key correctness detail is step 1: if both a flask and the flask's own
+-- Stonescale Oil have targets, the Stonescale Oil's demand accumulates fully
+-- from both sources before stock is subtracted once.
+function addon:ComputeGatheringList()
+  local out = {}
+  if not addon.ITEMS then return out end
+  BuildRecipeMaps()
+  BuildRoundUpMap()
+
+  local demand = {}
+  for _, section in pairs(addon.ITEMS) do
+    for _, group in ipairs(section) do
+      for _, item in ipairs(group.items) do
+        if item.id then
+          local target = HelloStockDB and HelloStockDB.targets and HelloStockDB.targets[item.id]
+          if target and target > 0 then
+            demand[item.id] = (demand[item.id] or 0) + target
+          end
+        end
+      end
+    end
+  end
+
+  -- Topological order of crafted items: consumers first, ingredients after.
+  local order, visited = {}, {}
+  local function visit(id)
+    if visited[id] then return end
+    visited[id] = true
+    local r = recipeMap[id]
+    if r then
+      for _, ing in ipairs(r) do
+        if recipeMap[ing.id] then visit(ing.id) end
+      end
+    end
+    table.insert(order, 1, id)
+  end
+  for id in pairs(recipeMap) do visit(id) end
+
+  for _, id in ipairs(order) do
+    local have = self:GetTotals(id)
+    local net  = math.max(0, (demand[id] or 0) - have)
+    if net > 0 then
+      local r      = recipeMap[id]
+      local yield  = r.yield or 1
+      local crafts = math.ceil(net / yield)
+      for _, ing in ipairs(r) do
+        demand[ing.id] = (demand[ing.id] or 0) + ing.count * crafts
+      end
+    end
+  end
+
+  for id, needed in pairs(demand) do
+    if not recipeMap[id] then
+      local rnd = roundUpMap[id]
+      if rnd then needed = math.ceil(needed / rnd) * rnd end
+      local have   = self:GetTotals(id)
+      local gather = needed - have
+      if gather > 0 then
+        out[#out + 1] = {
+          id       = id,
+          gather   = gather,
+          have     = have,
+          needed   = needed,
+          category = self:GetItemCategory(id),
+        }
+      end
+    end
+  end
+
+  table.sort(out, function(a, b)
+    if a.gather ~= b.gather then return a.gather > b.gather end
+    return a.id < b.id
+  end)
+  return out
+end
+
+-- Sibling to ComputeGatheringList: same demand propagation, but emits the
+-- recipe (craftable) items themselves rather than their raw ingredients.
+-- Result: a list of every craft you'd need to perform to bring all targeted
+-- items up to their levels (including intermediate crafts like Stonescale Oil
+-- when a flask using it is under target).
+function addon:ComputeCraftList()
+  local out = {}
+  if not addon.ITEMS then return out end
+  BuildRecipeMaps()
+
+  local demand = {}
+  for _, section in pairs(addon.ITEMS) do
+    for _, group in ipairs(section) do
+      for _, item in ipairs(group.items) do
+        if item.id then
+          local target = HelloStockDB and HelloStockDB.targets and HelloStockDB.targets[item.id]
+          if target and target > 0 then
+            demand[item.id] = (demand[item.id] or 0) + target
+          end
+        end
+      end
+    end
+  end
+
+  local order, visited = {}, {}
+  local function visit(id)
+    if visited[id] then return end
+    visited[id] = true
+    local r = recipeMap[id]
+    if r then
+      for _, ing in ipairs(r) do
+        if recipeMap[ing.id] then visit(ing.id) end
+      end
+    end
+    table.insert(order, 1, id)
+  end
+  for id in pairs(recipeMap) do visit(id) end
+
+  for _, id in ipairs(order) do
+    local have = self:GetTotals(id)
+    local net  = math.max(0, (demand[id] or 0) - have)
+    if net > 0 then
+      local r      = recipeMap[id]
+      local yield  = r.yield or 1
+      local crafts = math.ceil(net / yield)
+      for _, ing in ipairs(r) do
+        demand[ing.id] = (demand[ing.id] or 0) + ing.count * crafts
+      end
+    end
+  end
+
+  for id, needed in pairs(demand) do
+    if recipeMap[id] then
+      local r      = recipeMap[id]
+      local yield  = r.yield or 1
+      local have   = self:GetTotals(id)
+      local rawNet = needed - have
+      if rawNet > 0 then
+        local crafts = math.ceil(rawNet / yield)
+        local craft  = crafts * yield
+        out[#out + 1] = {
+          id       = id,
+          craft    = craft,
+          crafts   = crafts,
+          yield    = yield,
+          have     = have,
+          needed   = have + craft,
+          category = self:GetItemCategory(id),
+        }
+      end
+    end
+  end
+
+  table.sort(out, function(a, b)
+    if a.craft ~= b.craft then return a.craft > b.craft end
+    return a.id < b.id
+  end)
+  return out
+end
+
+-- Profession-recipe scanning. Tracks which tracked items each character can
+-- craft, based on what the open trade-skill / craft window exposes. The data
+-- is per-character (stored on HelloStockDB.characters[key].crafts) and is
+-- included in sync snapshots so peer-account chars learn each other's recipes.
+local function MarkCanCraft(itemID)
+  if not itemID or not addon:IsTracked(itemID) then return false end
+  local c = addon:GetSelf()
+  if not c then return false end
+  c.crafts = c.crafts or {}
+  if c.crafts[itemID] then return false end
+  c.crafts[itemID] = true
+  return true
+end
+
+local function ScanTradeSkillsNow()
+  if not GetNumTradeSkills then return false end
+  local changed = false
+  -- Expand collapsed headers so every recipe becomes visible.
+  for i = (GetNumTradeSkills() or 0), 1, -1 do
+    local _, skillType = GetTradeSkillInfo(i)
+    if skillType == "header" and ExpandTradeSkillSubClass then
+      ExpandTradeSkillSubClass(i)
+    end
+  end
+  for i = 1, (GetNumTradeSkills() or 0) do
+    local _, skillType = GetTradeSkillInfo(i)
+    if skillType and skillType ~= "header" and GetTradeSkillItemLink then
+      local link = GetTradeSkillItemLink(i)
+      local id   = link and tonumber(link:match("item:(%d+)"))
+      if id and MarkCanCraft(id) then changed = true end
+    end
+  end
+  return changed
+end
+
+local function ScanCraftsNow()
+  if not GetNumCrafts then return false end
+  local changed = false
+  for i = (GetNumCrafts() or 0), 1, -1 do
+    local _, _, craftType = GetCraftInfo(i)
+    if craftType == "header" and ExpandCraftSkillLine then
+      ExpandCraftSkillLine(i)
+    end
+  end
+  for i = 1, (GetNumCrafts() or 0) do
+    local _, _, craftType = GetCraftInfo(i)
+    if craftType and craftType ~= "header" and GetCraftItemLink then
+      local link = GetCraftItemLink(i)
+      local id   = link and tonumber(link:match("item:(%d+)"))
+      if id and MarkCanCraft(id) then changed = true end
+    end
+  end
+  return changed
+end
+
+local function ScanRecipes()
+  local a = ScanTradeSkillsNow()
+  local b = ScanCraftsNow()
+  if (a or b) and addon.Comm then addon.Comm:SendSnapshot() end
+  if addon.UI and addon.UI:IsShown() then addon.UI:Refresh() end
 end
 
 local function ScanContainers(bagList)
@@ -145,6 +459,7 @@ function addon:ReceiveSnapshot(snap, senderHash)
     accountID    = incomingAcct,
     bags         = snap.bags or {},
     bank         = snap.bank or {},
+    crafts       = snap.crafts or {},
     bagsUpdated  = snap.ts or 0,
     bankUpdated  = snap.ts or 0,
     source       = isMine and "self" or "sync",
@@ -172,6 +487,28 @@ end
 
 local function ConnectedRealmSet() return addon:ConnectedRealmSet() end
 
+-- List of characters (in same-faction + connected-realm scope) that know how
+-- to craft itemID. Each entry: { name = "Char-Realm", isMine = bool }.
+-- Sorted alphabetically. Used by the global tooltip hook.
+function addon:GetCrafters(itemID)
+  local out = {}
+  if not HelloStockDB or not HelloStockDB.characters then return out end
+  local myFaction = UnitFactionGroup("player") or "Neutral"
+  local realmSet  = self:ConnectedRealmSet()
+  local myID      = self:GetAccountID()
+  for _, c in pairs(HelloStockDB.characters) do
+    if c.faction == myFaction and c.realm and realmSet[self:NormalizeRealm(c.realm)]
+       and c.crafts and c.crafts[itemID] then
+      out[#out + 1] = {
+        name   = (c.name or "?") .. "-" .. (c.realm or "?"),
+        isMine = c.accountID == myID,
+      }
+    end
+  end
+  table.sort(out, function(a, b) return a.name < b.name end)
+  return out
+end
+
 -- Sum a single item across every character on the same faction and connected-realm group.
 function addon:GetTotals(itemID)
   local total, breakdown = 0, {}
@@ -179,13 +516,18 @@ function addon:GetTotals(itemID)
 
   local myFaction = UnitFactionGroup("player") or "Neutral"
   local realmSet  = ConnectedRealmSet()
+  local myID      = self:GetAccountID()
 
   for _, c in pairs(HelloStockDB.characters) do
     if c.faction == myFaction and c.realm and realmSet[addon:NormalizeRealm(c.realm)] then
       local n = (c.bags and c.bags[itemID] or 0) + (c.bank and c.bank[itemID] or 0)
       if n > 0 then
         total = total + n
-        breakdown[#breakdown + 1] = { name = (c.name or "?") .. "-" .. (c.realm or "?"), count = n }
+        breakdown[#breakdown + 1] = {
+          name   = (c.name or "?") .. "-" .. (c.realm or "?"),
+          count  = n,
+          isMine = c.accountID == myID,
+        }
       end
     end
   end
@@ -194,10 +536,10 @@ function addon:GetTotals(itemID)
 end
 
 local function PrimeItemCache()
-  for _, section in pairs(addon.DEFAULT_ITEMS) do
+  for _, section in pairs(addon.ITEMS) do
     for _, group in ipairs(section) do
       for _, item in ipairs(group.items) do
-        GetItemInfo(item.id)
+        if item.id then GetItemInfo(item.id) end
       end
     end
   end
@@ -210,6 +552,10 @@ f:RegisterEvent("BANKFRAME_OPENED")
 f:RegisterEvent("BANKFRAME_CLOSED")
 f:RegisterEvent("PLAYERBANKSLOTS_CHANGED")
 f:RegisterEvent("GET_ITEM_INFO_RECEIVED")
+f:RegisterEvent("TRADE_SKILL_SHOW")
+f:RegisterEvent("TRADE_SKILL_UPDATE")
+f:RegisterEvent("CRAFT_SHOW")
+f:RegisterEvent("CRAFT_UPDATE")
 
 local bankOpen = false
 local pendingItemRefresh = false
@@ -257,6 +603,10 @@ f:SetScript("OnEvent", function(_, event)
       pendingItemRefresh = true
       C_Timer.After(0.5, function() pendingItemRefresh = false; RefreshUI() end)
     end
+  elseif event == "TRADE_SKILL_SHOW" or event == "TRADE_SKILL_UPDATE"
+      or event == "CRAFT_SHOW"       or event == "CRAFT_UPDATE" then
+    -- A small delay gives the client time to populate the recipe list.
+    C_Timer.After(0.1, ScanRecipes)
   end
 end)
 
@@ -439,6 +789,24 @@ StaticPopupDialogs["HELLOSTOCK_UNPAIR"] = {
   preferredIndex = 3,
 }
 
+StaticPopupDialogs["HELLOSTOCK_CLEAR_TARGETS"] = {
+  text         = "HelloStock: clear every target stock level?\nThis only wipes the per-item targets; bag/bank snapshots and pairing are unaffected. The empty target list will sync to any paired account.",
+  button1      = "Clear",
+  button2      = CANCEL,
+  OnAccept     = function()
+    HelloStockDB = HelloStockDB or {}
+    HelloStockDB.targets = {}
+    HelloStockDB.targetsUpdatedAt = time()
+    if addon.Comm and addon.Comm.SendTargets then addon.Comm:SendTargets() end
+    if addon.UI and addon.UI:IsShown() then addon.UI:Refresh() end
+    print("|cffffd700HelloStock:|r all targets cleared.")
+  end,
+  timeout      = 30,
+  whileDead    = true,
+  hideOnEscape = true,
+  preferredIndex = 3,
+}
+
 StaticPopupDialogs["HELLOSTOCK_RESET"] = {
   text         = "HelloStock: erase all stored data?\nThis wipes character snapshots, targets, pairing keys, trusted list, and UI state. UI will reload.",
   button1      = "Reset",
@@ -585,6 +953,37 @@ SlashCmdList["HELLOSTOCK"] = function(msg)
   elseif cmd == "reset" then
     StaticPopup_Show("HELLOSTOCK_RESET")
 
+  elseif cmd == "resetpos" then
+    if addon.UI and addon.UI.ResetPosition then
+      addon.UI:ResetPosition()
+      print("|cffffd700HelloStock:|r window position reset to default.")
+    end
+
+  elseif cmd == "minimap" then
+    if addon.SetMinimapHidden and addon.IsMinimapHidden then
+      addon:SetMinimapHidden(not addon:IsMinimapHidden())
+      print("|cffffd700HelloStock:|r minimap button " ..
+        (addon:IsMinimapHidden() and "hidden" or "shown") .. ".")
+      if addon.RefreshOptions then addon:RefreshOptions() end
+    end
+
+  elseif cmd == "cleartargets" then
+    StaticPopup_Show("HELLOSTOCK_CLEAR_TARGETS")
+
+  elseif cmd == "gather" then
+    local list = addon:ComputeGatheringList()
+    if #list == 0 then
+      print("|cffffd700HelloStock:|r nothing to gather — every target met.")
+    else
+      print(("|cffffd700HelloStock gather list (%d reagent%s):|r")
+        :format(#list, #list == 1 and "" or "s"))
+      for _, entry in ipairs(list) do
+        local name = GetItemInfo(entry.id) or ("Item " .. entry.id)
+        print(("  %s — gather %d  (have %d, need %d)")
+          :format(name, entry.gather, entry.have, entry.needed))
+      end
+    end
+
   elseif cmd == "chars" then
     local myID = addon:GetAccountID()
     local chars = HelloStockDB and HelloStockDB.characters or {}
@@ -688,6 +1087,6 @@ SlashCmdList["HELLOSTOCK"] = function(msg)
     end
 
   else
-    print("|cffffd700HelloStock:|r commands: /hs, /hs pair [name], /hs secret [word], /hs unpair, /hs sync, /hs status, /hs whoami, /hs chars, /hs claim <name>, /hs claimall, /hs forget <name>, /hs debug, /hs config, /hs ping, /hs reset")
+    print("|cffffd700HelloStock:|r commands: /hs, /hs pair [name], /hs secret [word], /hs unpair, /hs sync, /hs status, /hs whoami, /hs chars, /hs claim <name>, /hs claimall, /hs forget <name>, /hs debug, /hs config, /hs ping, /hs resetpos, /hs minimap, /hs gather, /hs cleartargets, /hs reset")
   end
 end

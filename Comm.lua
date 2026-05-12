@@ -40,16 +40,31 @@ local function DecodeItems(s)
   return t
 end
 
+local function EncodeIDs(set)
+  if not set then return "" end
+  local parts = {}
+  for id in pairs(set) do parts[#parts + 1] = tostring(id) end
+  return table.concat(parts, ",")
+end
+
+local function DecodeIDs(s)
+  local t = {}
+  if not s or s == "" then return t end
+  for id in s:gmatch("%d+") do t[tonumber(id)] = true end
+  return t
+end
+
 local function BuildPayload(c)
   return table.concat({
-    "v="   .. PROTO_VERSION,
-    "n="   .. (c.name or ""),
-    "r="   .. (c.realm or ""),
-    "f="   .. (c.faction or "Neutral"),
-    "a="   .. (c.accountID or ""),
-    "ts="  .. (c.bagsUpdated or 0),
-    "bag=" .. EncodeItems(c.bags),
-    "bnk=" .. EncodeItems(c.bank),
+    "v="    .. PROTO_VERSION,
+    "n="    .. (c.name or ""),
+    "r="    .. (c.realm or ""),
+    "f="    .. (c.faction or "Neutral"),
+    "a="    .. (c.accountID or ""),
+    "ts="   .. (c.bagsUpdated or 0),
+    "bag="  .. EncodeItems(c.bags),
+    "bnk="  .. EncodeItems(c.bank),
+    "crft=" .. EncodeIDs(c.crafts),
   }, FIELD_SEP)
 end
 
@@ -220,6 +235,14 @@ function Comm:PendingSends()
   return #sendQueue
 end
 
+-- True if any sync activity is currently in flight: outbound packets queued or
+-- scheduled, or inbound chunks waiting to be reassembled.
+function Comm:IsBusy()
+  if #sendQueue > 0 or sendTimer or pendingTimer then return true end
+  for _ in pairs(incoming) do return true end
+  return false
+end
+
 local function DebugDrop(name, reason)
   if HelloStockDB and HelloStockDB.debug then
     print(("|cffaa3333[HS drop]|r %s: %s"):format(tostring(name), reason))
@@ -270,6 +293,7 @@ local function HandleSnapshot(buf, senderHash)
     ts        = tonumber(fields.ts) or 0,
     bags      = DecodeItems(fields.bag),
     bank      = DecodeItems(fields.bnk),
+    crafts    = DecodeIDs(fields.crft),
   }
   if HelloStockDB and HelloStockDB.debug then
     print(("|cff888888[HS recv]|r %s-%s"):format(tostring(snap.name), tostring(snap.realm)))
@@ -392,6 +416,38 @@ local function OnAddonMessage(prefix, msg, channel, sender)
     addon:RecordPeerPlaceholder(n, r, f, (a ~= "" and a) or nil)
   end
 end
+
+-- Swallow "No player named 'X' is currently playing." system messages when X
+-- is one of our paired-account sync targets. Offline peers are routine after
+-- login (PLAYER_ENTERING_WORLD triggers a snapshot broadcast to every peer
+-- character); manual whispers from the user stay visible because we only
+-- suppress when the named player matches a known sync target.
+local notFoundPattern do
+  local fmt = ERR_CHAT_PLAYER_NOT_FOUND_S or "No player named '%s' is currently playing."
+  local templated = fmt:gsub("%%s", "\1")  -- placeholder safe from pattern escaping
+  local escaped   = templated:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1")
+  notFoundPattern = "^" .. escaped:gsub("\1", "(.+)") .. "$"
+end
+
+local function BaseName(s)
+  return (s and s:match("^([^%-]+)")) or s
+end
+
+local function IsKnownSyncTarget(name)
+  if not addon.GetWhisperTargets then return false end
+  local base = BaseName(name)
+  for _, target in ipairs(addon:GetWhisperTargets()) do
+    if target == name or BaseName(target) == base then return true end
+  end
+  return false
+end
+
+ChatFrame_AddMessageEventFilter("CHAT_MSG_SYSTEM", function(_, _, message)
+  local missing = message and message:match(notFoundPattern)
+  if missing and IsKnownSyncTarget(missing) then
+    return true  -- suppress
+  end
+end)
 
 C_ChatInfo.RegisterAddonMessagePrefix(PREFIX)
 Comm:RegisterEvent("CHAT_MSG_ADDON")

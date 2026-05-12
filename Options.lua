@@ -13,9 +13,19 @@ subtitle:SetWidth(560)
 subtitle:SetJustifyH("LEFT")
 subtitle:SetText("Track crafting ingredients and consumables across all your characters and any paired account.")
 
+-- Minimap button toggle
+local minimapCheck = CreateFrame("CheckButton", "HelloStockOptMinimap", panel, "InterfaceOptionsCheckButtonTemplate")
+minimapCheck:SetPoint("TOPLEFT", subtitle, "BOTTOMLEFT", -2, -12)
+_G["HelloStockOptMinimapText"]:SetText("Show minimap button")
+minimapCheck:SetScript("OnClick", function(self)
+  if addon.SetMinimapHidden then
+    addon:SetMinimapHidden(not self:GetChecked())
+  end
+end)
+
 -- Debug logging
 local debugCheck = CreateFrame("CheckButton", "HelloStockOptDebug", panel, "InterfaceOptionsCheckButtonTemplate")
-debugCheck:SetPoint("TOPLEFT", subtitle, "BOTTOMLEFT", -2, -16)
+debugCheck:SetPoint("TOPLEFT", minimapCheck, "BOTTOMLEFT", 0, -4)
 _G["HelloStockOptDebugText"]:SetText("Enable debug logging in chat")
 debugCheck:SetScript("OnClick", function(self)
   HelloStockDB = HelloStockDB or {}
@@ -45,9 +55,25 @@ unpairBtn:SetPoint("TOPLEFT", secretLabel, "BOTTOMLEFT", 0, -12)
 unpairBtn:SetText("Unpair")
 unpairBtn:SetScript("OnClick", function() StaticPopup_Show("HELLOSTOCK_UNPAIR") end)
 
+-- Window section
+local windowHeader = panel:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
+windowHeader:SetPoint("TOPLEFT", unpairBtn, "BOTTOMLEFT", 0, -20)
+windowHeader:SetText("Window")
+
+local resetPosBtn = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
+resetPosBtn:SetSize(130, 22)
+resetPosBtn:SetPoint("TOPLEFT", windowHeader, "BOTTOMLEFT", 0, -8)
+resetPosBtn:SetText("Reset position")
+resetPosBtn:SetScript("OnClick", function()
+  if addon.UI and addon.UI.ResetPosition then
+    addon.UI:ResetPosition()
+    print("|cffffd700HelloStock:|r window position reset to default.")
+  end
+end)
+
 -- Data section
 local dataHeader = panel:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
-dataHeader:SetPoint("TOPLEFT", unpairBtn, "BOTTOMLEFT", 0, -20)
+dataHeader:SetPoint("TOPLEFT", resetPosBtn, "BOTTOMLEFT", 0, -20)
 dataHeader:SetText("Data")
 
 local dataCount = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
@@ -77,6 +103,7 @@ end
 
 local function Refresh()
   debugCheck:SetChecked(HelloStockDB and HelloStockDB.debug or false)
+  minimapCheck:SetChecked(addon.IsMinimapHidden and not addon:IsMinimapHidden() or true)
   accountLabel:SetText("Account ID: " .. (addon:GetAccountID() or "?"))
   local hash = addon:GetSecretHash()
   if hash == "" then

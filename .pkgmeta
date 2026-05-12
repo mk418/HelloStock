@@ -1,0 +1,21 @@
+# BigWigs packager config. Used by the release-builder GitHub Action.
+
+package-as: HelloStock
+
+# Files that should NOT end up in the released zip. The packager
+# already excludes hidden files by default, but listing key items
+# explicitly avoids surprises.
+ignore:
+    - .gitignore
+    - .pkgmeta
+    - .github
+    - README.md
+    - LICENSE
+    # Project logo. Kept in the repo for use as the CurseForge project
+    # icon, but not referenced anywhere in the addon itself — WoW can't
+    # load PNG textures at runtime. Excluded from the released zip so
+    # users don't pull down a file the addon never reads.
+    - HelloStock.png
+
+# No `manual-changelog` block: the packager auto-generates the
+# changelog from git commit messages between tags.

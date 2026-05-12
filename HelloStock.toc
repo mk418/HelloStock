@@ -2,8 +2,9 @@
 ## Title: HelloStock
 ## Notes: Track crafting ingredients and consumables across all your characters.
 ## Author: Drikk
-## Version: 0.1
+## Version: @project-version@
 ## SavedVariables: HelloStockDB
+## X-Curse-Project-ID: 1540866
 
 Defaults.lua
 Comm.lua

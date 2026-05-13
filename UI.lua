@@ -1,9 +1,7 @@
 local _, addon = ...
 
 local function TargetsStore()
-  HelloStockDB = HelloStockDB or {}
-  HelloStockDB.targets = HelloStockDB.targets or {}
-  return HelloStockDB.targets
+  return addon:GetTargets().items
 end
 
 local function GetTarget(itemID)
@@ -12,13 +10,13 @@ end
 
 local targetsSendPending = false
 local function SetTarget(itemID, val)
-  local store = TargetsStore()
+  local bucket = addon:GetTargets()
   if val and val > 0 then
-    store[itemID] = val
+    bucket.items[itemID] = val
   else
-    store[itemID] = nil
+    bucket.items[itemID] = nil
   end
-  HelloStockDB.targetsUpdatedAt = time()
+  bucket.updatedAt = time()
   if addon.Comm and addon.Comm.SendTargets and not targetsSendPending then
     targetsSendPending = true
     C_Timer.After(2, function()
@@ -34,8 +32,11 @@ UI:SetMovable(true)
 UI:EnableMouse(true)
 UI:RegisterForDrag("LeftButton")
 UI:SetClampedToScreen(true)
+-- HIGH strata stays above lower-strata frames like the minimap, but bags
+-- are HIGH-with-toplevel="true" so their auto-raise on show pops them in
+-- front of us. The previous OnMouseDown:Raise() hook re-raised HelloStock
+-- above bags on every click, which is the behavior we don't want anymore.
 UI:SetFrameStrata("HIGH")
-UI:SetScript("OnMouseDown", function(self) self:Raise() end)
 -- Opt out of WoW's per-character layout-cache (layout-local.txt). Position is
 -- managed by us via HelloStockDB.ui.point so it lives per-account instead.
 UI:SetUserPlaced(false)
@@ -81,77 +82,119 @@ UI:Hide()
 
 UI.TitleText:SetText("HelloStock")
 
+
 local currentTab = "Consumables"
 
-local function MakeTab(label, anchor)
-  local b = CreateFrame("Button", nil, UI, "UIPanelButtonTemplate")
-  b:SetSize(108, 22)
+-- Bottom tabs in Blizzard's character-frame / spellbook style. The
+-- PanelTabButtonTemplate gives the raised-tab graphic; we just feed it
+-- text and let it auto-size to fit. PanelTemplates_SetTab handles the
+-- "selected" raised state on whichever tab is active.
+local bottomTabs = {}
+local function MakeBottomTab(label, index)
+  local b = CreateFrame("Button", "HelloStockBottomTab" .. index, UI, "CharacterFrameTabButtonTemplate")
+  b:SetID(index)
   b:SetText(label)
-  if anchor then
-    b:SetPoint("LEFT", anchor, "RIGHT", 4, 0)
+  if PanelTemplates_TabResize then PanelTemplates_TabResize(b, 0) end
+  if index == 1 then
+    b:SetPoint("TOPLEFT", UI, "BOTTOMLEFT", 11, 2)
   else
-    b:SetPoint("TOPLEFT", 10, -28)
+    b:SetPoint("LEFT", bottomTabs[index - 1], "RIGHT", -16, 0)
   end
   b:SetScript("OnClick", function()
     UI:ClearAllFocus()
     currentTab = label
     UI:Refresh()
   end)
+  b.label = label
+  bottomTabs[#bottomTabs + 1] = b
   return b
 end
 
-local tabCons   = MakeTab("Consumables", nil)
-local tabIng    = MakeTab("Ingredients", tabCons)
-local tabGather = MakeTab("To gather", tabIng)
-local tabCraft  = MakeTab("To craft", tabGather)
+MakeBottomTab("Consumables", 1)
+MakeBottomTab("Ingredients", 2)
+MakeBottomTab("To gather",   3)
+MakeBottomTab("To craft",    4)
+MakeBottomTab("Characters",  5)
+PanelTemplates_SetNumTabs(UI, #bottomTabs)
 
-local syncBtn = CreateFrame("Button", nil, UI, "UIPanelButtonTemplate")
-syncBtn:SetSize(80, 22)
-syncBtn:SetPoint("TOPRIGHT", -8, -28)
-syncBtn:SetText("Sync")
-syncBtn:Hide()
-syncBtn:SetScript("OnClick", function()
-  UI:ClearAllFocus()
-  local targets = addon.GetWhisperTargets and addon:GetWhisperTargets() or {}
-  if #targets == 0 then
-    print("|cffffd700HelloStock:|r no paired characters known — pair via /hs pair first.")
-    return
+local function UpdateBottomTabSelection()
+  -- Call the tab-state helpers directly per-tab rather than going through
+  -- PanelTemplates_SetTab → PanelTemplates_UpdateTabs, which expects tabs
+  -- to be named `<frame>Tab<n>` and silently no-ops if they aren't.
+  for _, b in ipairs(bottomTabs) do
+    if b.label == currentTab then
+      PanelTemplates_SelectTab(b)
+    else
+      PanelTemplates_DeselectTab(b)
+    end
   end
-  if addon.Comm and addon.Comm.SendSnapshot then
-    addon.Comm:SendSnapshot(true)
-    print("|cffffd700HelloStock:|r snapshot pushed.")
-  end
+end
+
+-- Sync-in-progress spinner. Shown in the top-right corner only while
+-- Comm:IsBusy() reports outbound packets queued or inbound chunks
+-- reassembling. The ring texture is rotated by an AnimationGroup, polled
+-- every 0.25s from OnUpdate (cheaper than animating per-frame and good
+-- enough at a glance).
+local syncSpinner = CreateFrame("Frame", nil, UI)
+syncSpinner:SetSize(18, 18)
+-- Sits at the left side of the footer row, sharing the row with the
+-- right-justified gold total — same vertical band, opposite end.
+syncSpinner:SetPoint("BOTTOMLEFT", UI, "BOTTOMLEFT", 6, 4)
+syncSpinner:Hide()
+
+syncSpinner.tex = syncSpinner:CreateTexture(nil, "ARTWORK")
+syncSpinner.tex:SetTexture("Interface\\Common\\StreamCircle")
+syncSpinner.tex:SetVertexColor(1, 0.82, 0)
+syncSpinner.tex:SetAllPoints()
+
+syncSpinner.anim = syncSpinner:CreateAnimationGroup()
+syncSpinner.anim:SetLooping("REPEAT")
+local rot = syncSpinner.anim:CreateAnimation("Rotation")
+rot:SetDegrees(-360)
+rot:SetDuration(1.2)
+
+syncSpinner:SetScript("OnShow", function(self) self.anim:Play() end)
+syncSpinner:SetScript("OnHide", function(self) self.anim:Stop() end)
+
+syncSpinner:EnableMouse(true)
+syncSpinner:SetScript("OnEnter", function(self)
+  GameTooltip:SetOwner(self, "ANCHOR_TOPRIGHT")
+  GameTooltip:AddLine("Syncing…", 1, 1, 1)
+  GameTooltip:AddLine("Outbound packets are still in flight or inbound chunks are reassembling.", 0.7, 0.7, 0.7, true)
+  GameTooltip:Show()
+end)
+syncSpinner:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+-- Poll Comm busy state and toggle the spinner. UI:Refresh also updates this
+-- so visible-state transitions track the live state without leaving the
+-- spinner stuck when the addon UI is hidden.
+local _spinnerTick = 0
+syncSpinner:SetScript("OnUpdate", function(self, elapsed)
+  _spinnerTick = _spinnerTick + elapsed
+  if _spinnerTick < 0.25 then return end
+  _spinnerTick = 0
+  local active = addon.Comm and addon.Comm.IsReceiving and addon.Comm:IsReceiving()
+  if not active then self:Hide() end
 end)
 
--- Disable the button while a sync (outbound packets queued or inbound chunks
--- reassembling) is in flight. OnUpdate only fires while the button is shown,
--- and it's shown only when paired, so this is otherwise cheap.
-local _syncBtnTick = 0
-syncBtn:SetScript("OnUpdate", function(self, elapsed)
-  _syncBtnTick = _syncBtnTick + elapsed
-  if _syncBtnTick < 0.25 then return end
-  _syncBtnTick = 0
-  local busy = addon.Comm and addon.Comm.IsBusy and addon.Comm:IsBusy()
-  if busy then self:Disable() else self:Enable() end
+-- A separate watcher that catches the *start* of inbound sync activity.
+-- The spinner's own OnUpdate only runs while the spinner is shown; we need
+-- this to flip it on when state goes idle → receiving.
+local _busyWatcher = CreateFrame("Frame", nil, UI)
+local _busyWatcherTick = 0
+_busyWatcher:SetScript("OnUpdate", function(_, elapsed)
+  _busyWatcherTick = _busyWatcherTick + elapsed
+  if _busyWatcherTick < 0.25 then return end
+  _busyWatcherTick = 0
+  local active = addon.Comm and addon.Comm.IsReceiving and addon.Comm:IsReceiving()
+  if active and not syncSpinner:IsShown() then syncSpinner:Show() end
 end)
-
--- Tooltip explaining why the button is greyed out. Motion scripts on a
--- disabled button only fire if we opt in explicitly.
-syncBtn:SetMotionScriptsWhileDisabled(true)
-syncBtn:HookScript("OnEnter", function(self)
-  if not self:IsEnabled() then
-    GameTooltip:SetOwner(self, "ANCHOR_LEFT")
-    GameTooltip:AddLine("Sync in progress…", 1, 1, 1)
-    GameTooltip:AddLine("Wait for the current sync to finish before pushing again.", 0.7, 0.7, 0.7, true)
-    GameTooltip:Show()
-  end
-end)
-syncBtn:HookScript("OnLeave", function() GameTooltip:Hide() end)
 
 local searchQuery = ""
 local targetsOnly = false
 local inStockOnly = false
 local underTargetOnly = false
+local craftableOnly = false
 local classFilter = nil  -- currently active filter (nil = "All classes", otherwise class name)
 local pickedClass = nil  -- last explicit dropdown choice (for the text-click toggle)
 local classFilterSource = "picked"  -- "picked" (dropdown / default) or "toggled" (text-clicked to player class)
@@ -193,6 +236,7 @@ local function SaveFilters()
     inStock     = inStockOnly,
     withTarget  = targetsOnly,
     underTarget = underTargetOnly,
+    craftable   = craftableOnly,
   }
   -- Class filter is per-character: each toon picks the class context that
   -- matches whoever is logged in, not whatever an alt last set.
@@ -211,6 +255,7 @@ local function LoadFilters()
     inStockOnly     = f.inStock     and true or false
     targetsOnly     = f.withTarget  and true or false
     underTargetOnly = f.underTarget and true or false
+    craftableOnly   = f.craftable   and true or false
   end
   local cs = CharStore()
   classFilter       = cs.class
@@ -220,7 +265,7 @@ end
 
 local search = CreateFrame("EditBox", "HelloStockSearch", UI, "InputBoxTemplate")
 search:SetSize(140, 20)
-search:SetPoint("TOPLEFT", 38, -58)
+search:SetPoint("TOPLEFT", 38, -32)
 search:SetAutoFocus(false)
 search:SetMaxLetters(40)
 search:SetScript("OnTextChanged", function(self)
@@ -301,11 +346,22 @@ end)
 underCheck:ClearAllPoints()
 underCheck:SetPoint("LEFT", _G["HelloStockTargetsCheckText"] or targetsCheck, "RIGHT", 6, 0)
 
+-- "Craftable" filter. Only meaningful (and only shown) on the "To craft" tab:
+-- when checked, rows are limited to those flagged green (fully craftable) or
+-- yellow (≥50% craftable from current stocks + intermediates).
+local craftableCheck = MakeFilterCheck("HelloStockCraftableCheck", "Craftable", underCheck, function(self)
+  craftableOnly = self:GetChecked() and true or false
+  SaveFilters()
+  UI:Refresh()
+end)
+craftableCheck:ClearAllPoints()
+craftableCheck:SetPoint("LEFT", searchClear, "RIGHT", 4, 0)
+
 -- Class filter dropdown. Filters items that carry a `classes` field (mostly
 -- consumables); items without the field show regardless of selection.
 -- Faction-restricted: Paladin only shown to Alliance, Shaman only to Horde.
 local classDD = CreateFrame("Frame", "HelloStockClassDD", UI, "UIDropDownMenuTemplate")
-classDD:SetPoint("TOPRIGHT", UI, "TOPRIGHT", 0, -52)
+classDD:SetPoint("TOPRIGHT", UI, "TOPRIGHT", 0, -26)
 UIDropDownMenu_SetWidth(classDD, 80)
 
 local function ClassDD_Init(_, level)
@@ -352,7 +408,7 @@ end
 -- the button; click the button to swap back to the dropdown.
 local classToggleBtn = CreateFrame("Button", "HelloStockClassToggleBtn", UI, "UIPanelButtonTemplate")
 classToggleBtn:SetSize(100, 25)
-classToggleBtn:SetPoint("TOPRIGHT", UI, "TOPRIGHT", -14, -53)
+classToggleBtn:SetPoint("TOPRIGHT", UI, "TOPRIGHT", -14, -27)
 classToggleBtn:SetText("")
 classToggleBtn:Hide()
 
@@ -407,18 +463,129 @@ local function ApplyFilterCheckboxes()
   stockCheck:SetChecked(inStockOnly)
   targetsCheck:SetChecked(targetsOnly)
   underCheck:SetChecked(underTargetOnly)
+  craftableCheck:SetChecked(craftableOnly)
   ApplyClassDDText()
 end
 
 local scroll = CreateFrame("ScrollFrame", "HelloStockScroll", UI, "UIPanelScrollFrameTemplate")
-scroll:SetPoint("TOPLEFT", 10, -84)
-scroll:SetPoint("BOTTOMRIGHT", -30, 10)
+scroll:SetPoint("TOPLEFT", 10, -58)
+scroll:SetPoint("BOTTOMRIGHT", -30, 26)
+
+-- Footer line showing aggregate gold across paired-account characters in the
+-- same faction/connected-realm scope.
+local moneyFooter = CreateFrame("Frame", nil, UI)
+moneyFooter:SetPoint("BOTTOMLEFT",  UI, "BOTTOMLEFT",   12,  6)
+moneyFooter:SetPoint("BOTTOMRIGHT", UI, "BOTTOMRIGHT", -12,  6)
+moneyFooter:SetHeight(18)
+moneyFooter.text = moneyFooter:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+moneyFooter.text:SetPoint("LEFT",  moneyFooter, "LEFT",  0, 0)
+moneyFooter.text:SetPoint("RIGHT", moneyFooter, "RIGHT", 0, 0)
+moneyFooter.text:SetJustifyH("RIGHT")
+moneyFooter.text:SetJustifyV("MIDDLE")
+
+local function FormatGold(copper)
+  copper = math.floor(copper or 0)
+  local g = math.floor(copper / 10000)
+  local s = math.floor((copper % 10000) / 100)
+  local c = copper % 100
+  return ("|cffffd100%d|rg |cffc7c7cf%d|rs |cffeda55f%d|rc"):format(g, s, c)
+end
+
+-- Mouse-catcher sized to just the rendered gold text. Without this the whole
+-- footer row (which extends to the left across the empty area where the
+-- spinner now lives) would trigger the tooltip whenever the cursor crosses
+-- the bottom of the frame.
+moneyFooter.hover = CreateFrame("Frame", nil, moneyFooter)
+moneyFooter.hover:SetPoint("BOTTOMRIGHT", moneyFooter, "BOTTOMRIGHT", 0, 0)
+moneyFooter.hover:SetPoint("TOPRIGHT",    moneyFooter, "TOPRIGHT",    0, 0)
+moneyFooter.hover:SetWidth(1)  -- resized to text width in RefreshMoney
+moneyFooter.hover:EnableMouse(true)
+moneyFooter.hover:SetScript("OnEnter", function(self)
+  local total, breakdown = addon:GetTotalMoney()
+  GameTooltip:SetOwner(self, "ANCHOR_TOPRIGHT")
+  GameTooltip:AddLine("Total gold across paired characters", 1, 0.82, 0)
+  GameTooltip:AddLine(FormatGold(total), 1, 1, 1)
+  if #breakdown > 0 then
+    GameTooltip:AddLine(" ")
+    for _, b in ipairs(breakdown) do
+      local label = b.isMine and b.name or (b.name .. " |cff888888(paired)|r")
+      local right = FormatGold(b.copper)
+      if b.transit and b.transit > 0 then
+        right = right .. (" |cffd8b66f(%s in transit)|r"):format(FormatGold(b.transit))
+      end
+      if b.mail and b.mail > 0 then
+        right = right .. (" |cff88aaee(%s in mail)|r"):format(FormatGold(b.mail))
+      end
+      GameTooltip:AddDoubleLine(label, right, 1, 1, 1, 1, 1, 1)
+    end
+  end
+  GameTooltip:Show()
+end)
+moneyFooter.hover:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+function UI:RefreshMoney()
+  local total = addon.GetTotalMoney and addon:GetTotalMoney() or 0
+  moneyFooter.text:SetText("Gold: " .. FormatGold(total))
+  moneyFooter.hover:SetWidth(moneyFooter.text:GetStringWidth() + 4)
+end
 
 local content = CreateFrame("Frame", nil, scroll)
 content:SetSize(520, 1)
 scroll:SetScrollChild(content)
 
 local rowPool, headerPool = {}, {}
+local charRowPool = {}
+
+-- Tab navigation between target-input boxes on the regular item tabs. Rows
+-- are pooled and reused; the displayed-in-current-tab subset is whichever
+-- `r:IsShown()`. Within that subset, pool index equals visual top-down
+-- order because RenderCharactersTab / the item-tab renderer assign rows
+-- in display order.
+local function EnsureRowVisible(row)
+  if not row or not row:IsShown() then return end
+  local rowTop, rowBottom = row:GetTop(), row:GetBottom()
+  local viewTop, viewBottom = scroll:GetTop(), scroll:GetBottom()
+  if not rowTop or not viewTop then return end
+  local currentScroll = scroll:GetVerticalScroll() or 0
+  if rowTop > viewTop then
+    -- Row sits above the viewport — scroll up just enough to bring its top
+    -- flush with the viewport top.
+    scroll:SetVerticalScroll(math.max(0, currentScroll - (rowTop - viewTop)))
+  elseif rowBottom < viewBottom then
+    -- Row sits below the viewport — scroll down so its bottom is flush with
+    -- the viewport bottom. Clamp to the scroll frame's range.
+    local maxScroll = scroll:GetVerticalScrollRange() or 0
+    scroll:SetVerticalScroll(math.min(maxScroll, currentScroll + (viewBottom - rowBottom)))
+  end
+end
+
+local function FocusAdjacentTargetBox(currentBox, reverse)
+  local visible = {}
+  for _, r in ipairs(rowPool) do
+    if r:IsShown() and r.targetBox and r.targetBox:IsShown() then
+      visible[#visible + 1] = r.targetBox
+    end
+  end
+  if #visible == 0 then return end
+  local idx
+  for i, tb in ipairs(visible) do
+    if tb == currentBox then idx = i; break end
+  end
+  if not idx then
+    visible[1]:SetFocus()
+    EnsureRowVisible(visible[1]:GetParent())
+    return
+  end
+  local nextIdx
+  if reverse then
+    nextIdx = idx - 1; if nextIdx < 1 then nextIdx = #visible end
+  else
+    nextIdx = idx + 1; if nextIdx > #visible then nextIdx = 1 end
+  end
+  local nextBox = visible[nextIdx]
+  nextBox:SetFocus()
+  EnsureRowVisible(nextBox:GetParent())
+end
 
 function UI:ClearAllFocus()
   if search and search:HasFocus() then search:ClearFocus() end
@@ -433,6 +600,22 @@ local function MakeRow(i)
   if rowPool[i] then return rowPool[i] end
   local row = CreateFrame("Frame", nil, content)
   row:SetSize(520, 20)
+  -- Tint behind a row, shown in the "To craft" view based on how much of the
+  -- required craft amount we can actually produce from current stocks (raw
+  -- ingredients + any intermediates we could craft from those). Green = full,
+  -- yellow = half or more, hidden otherwise. Vendor reagents (vials) are
+  -- treated as unlimited.
+  row.craftableBg = row:CreateTexture(nil, "BACKGROUND")
+  row.craftableBg:SetPoint("TOPLEFT",     row, "TOPLEFT",      2, -1)
+  row.craftableBg:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", -2,  1)
+  row.craftableBg:Hide()
+  -- Subtle highlight shown while this row's target editbox holds focus, so
+  -- you can see at a glance which row you're typing into during Tab-walks.
+  row.focusBg = row:CreateTexture(nil, "BACKGROUND")
+  row.focusBg:SetColorTexture(1, 0.82, 0, 0.08)
+  row.focusBg:SetPoint("TOPLEFT",     row, "TOPLEFT",      2, -1)
+  row.focusBg:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", -2,  1)
+  row.focusBg:Hide()
   row.icon = row:CreateTexture(nil, "ARTWORK")
   row.icon:SetSize(16, 16)
   row.icon:SetPoint("LEFT", 4, 0)
@@ -550,6 +733,15 @@ local function MakeRow(i)
     if shift and subs then header = header .. " (raw)" end
     GameTooltip:AddLine(header .. ":", 1, 0.82, 0)
 
+    local function FormatNeed(id, need)
+      local have    = (addon.GetTotals and addon:GetTotals(id)) or 0
+      local missing = math.max(0, need - have)
+      if missing > 0 then
+        return ("%d  |cffff5555(short %d)|r"):format(need, missing)
+      end
+      return tostring(need)
+    end
+
     if shift and subs then
       local raw = {}
       ExpandIngredients(row.itemID, qty, raw)
@@ -560,13 +752,13 @@ local function MakeRow(i)
       end)
       for _, id in ipairs(ids) do
         local name = GetItemInfo(id) or ("Item " .. id)
-        GameTooltip:AddDoubleLine("  " .. name, raw[id], 1, 1, 1, 1, 1, 1)
+        GameTooltip:AddDoubleLine("  " .. name, FormatNeed(id, raw[id]), 1, 1, 1, 1, 1, 1)
       end
     elseif recipe and #recipe > 0 then
       for _, ing in ipairs(recipe) do
         local total = ing.count * crafts
         local name  = GetItemInfo(ing.id) or ("Item " .. ing.id)
-        GameTooltip:AddDoubleLine("  " .. name, total, 1, 1, 1, 1, 1, 1)
+        GameTooltip:AddDoubleLine("  " .. name, FormatNeed(ing.id, total), 1, 1, 1, 1, 1, 1)
       end
       if subs then
         GameTooltip:AddLine(" ")
@@ -626,6 +818,7 @@ local function MakeRow(i)
   row.targetBox:SetFrameLevel(row:GetFrameLevel() + 5)
   row.targetBox:SetScript("OnMouseDown", function(self) self:SetFocus() end)
   row.targetBox:SetScript("OnEditFocusGained", function(self)
+    if row.focusBg then row.focusBg:Show() end
     -- Defer one frame so WoW's internal cursor-positioning (which runs after
     -- this event) can't clobber our selection.
     C_Timer.After(0, function() self:HighlightText(0, -1) end)
@@ -637,8 +830,14 @@ local function MakeRow(i)
   end)
   row.targetBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
   row.targetBox:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
-  row.targetBox:SetScript("OnTabPressed", function(self) self:ClearFocus() end)
-  row.targetBox:SetScript("OnEditFocusLost", function() UI:Refresh() end)
+  row.targetBox:SetScript("OnTabPressed", function(self) FocusAdjacentTargetBox(self, IsShiftKeyDown()) end)
+  -- Defer Refresh by one frame so Tab navigation can establish focus on the
+  -- next box before the pool-hide pass runs (Refresh bails out if any
+  -- target box still has focus).
+  row.targetBox:SetScript("OnEditFocusLost", function()
+    if row.focusBg then row.focusBg:Hide() end
+    C_Timer.After(0, function() UI:Refresh() end)
+  end)
 
   function row:ApplyVisual()
     if not self.itemID then return end
@@ -699,6 +898,65 @@ local function ToggleCollapsed(tab, category)
   local store = CollapseStore()
   local k = CategoryKey(tab, category)
   store[k] = not store[k] or nil
+end
+
+-- One row of the Characters overview tab. Two-line layout: identity + stats
+-- on top, full profession list with skill levels on a smaller second line.
+-- Separate pool from MakeRow because the column layout is entirely different.
+local CHAR_ROW_HEIGHT = 34
+local function MakeCharRow(i)
+  if charRowPool[i] then return charRowPool[i] end
+  local row = CreateFrame("Button", nil, content)
+  row:SetSize(520, CHAR_ROW_HEIGHT)
+  row:RegisterForClicks("RightButtonUp")
+
+  row.bg = row:CreateTexture(nil, "BACKGROUND")
+  row.bg:SetAllPoints()
+  row.bg:SetColorTexture(1, 1, 1, 0)
+
+  row:SetScript("OnEnter", function(self)
+    self.bg:SetColorTexture(1, 1, 1, 0.05)
+  end)
+  row:SetScript("OnLeave", function(self)
+    self.bg:SetColorTexture(1, 1, 1, 0)
+  end)
+
+  -- Top line: name + last sync + gold + pending-incoming-mail count.
+  row.name = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  row.name:SetPoint("TOPLEFT",  row, "TOPLEFT",   8, -2)
+  row.name:SetPoint("TOPRIGHT", row, "TOPRIGHT", -190, -2)
+  row.name:SetHeight(16)
+  row.name:SetJustifyH("LEFT")
+  row.name:SetWordWrap(false)
+
+  row.lastSync = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  row.lastSync:SetPoint("TOPRIGHT", row, "TOPRIGHT", -130, -3)
+  row.lastSync:SetWidth(50)
+  row.lastSync:SetHeight(16)
+  row.lastSync:SetJustifyH("RIGHT")
+
+  row.gold = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+  row.gold:SetPoint("TOPRIGHT", row, "TOPRIGHT", -55, -2)
+  row.gold:SetWidth(70)
+  row.gold:SetHeight(16)
+  row.gold:SetJustifyH("RIGHT")
+
+  row.pending = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+  row.pending:SetPoint("TOPRIGHT", row, "TOPRIGHT", -10, -2)
+  row.pending:SetWidth(40)
+  row.pending:SetHeight(16)
+  row.pending:SetJustifyH("RIGHT")
+
+  -- Second line: every profession with skill level, in trade-skill orange.
+  row.professions = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  row.professions:SetPoint("BOTTOMLEFT",  row, "BOTTOMLEFT",  14, 4)
+  row.professions:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", -10, 4)
+  row.professions:SetHeight(12)
+  row.professions:SetJustifyH("LEFT")
+  row.professions:SetWordWrap(false)
+
+  charRowPool[i] = row
+  return row
 end
 
 local function MakeHeader(i)
@@ -766,7 +1024,7 @@ end
 
 local toggleAllBtn = CreateFrame("Button", nil, UI)
 toggleAllBtn:SetSize(14, 14)
-toggleAllBtn:SetPoint("TOPLEFT", 12, -61)
+toggleAllBtn:SetPoint("TOPLEFT", 12, -35)
 toggleAllBtn:SetNormalTexture("Interface\\Buttons\\UI-MinusButton-Up")
 toggleAllBtn:SetPushedTexture("Interface\\Buttons\\UI-MinusButton-Down")
 toggleAllBtn:SetHighlightTexture("Interface\\Buttons\\UI-PlusButton-Hilight", "ADD")
@@ -801,9 +1059,210 @@ toggleAllBtn:SetScript("OnClick", function()
   UI:Refresh()
 end)
 
+local function FormatRelTime(t)
+  if not t or t == 0 then return "—" end
+  local age = time() - t
+  if age < 60      then return "now"               end
+  if age < 3600    then return ("%dm"):format(math.floor(age / 60))    end
+  if age < 86400   then return ("%dh"):format(math.floor(age / 3600))  end
+  if age < 604800  then return ("%dd"):format(math.floor(age / 86400)) end
+  return ("%dw"):format(math.floor(age / 604800))
+end
+
+local function RecencyColor(t)
+  if not t or t == 0 then return 0.6, 0.6, 0.6 end
+  local age = time() - t
+  if age < 3600    then return 0.4, 1.0, 0.4 end  -- green   < 1h
+  if age < 86400   then return 1.0, 1.0, 1.0 end  -- white   < 24h
+  if age < 604800  then return 1.0, 0.82, 0.0 end -- yellow  < 7d
+  return 1.0, 0.3, 0.3                            -- red     >= 7d
+end
+
+local function CompactGold(copper)
+  copper = math.floor(copper or 0)
+  if copper == 0 then return "—" end
+  local g = math.floor(copper / 10000)
+  if g >= 1000 then return ("%.1fkg"):format(g / 1000) end
+  if g >= 1    then return g .. "g"                    end
+  local s = math.floor((copper % 10000) / 100)
+  if s >= 1 then return s .. "s" end
+  return (copper % 100) .. "c"
+end
+
+local function ClassColorString(class)
+  if not class then return "ffffffff" end
+  local c = RAID_CLASS_COLORS and RAID_CLASS_COLORS[class]
+  if not c then return "ffffffff" end
+  return ("ff%02x%02x%02x"):format(c.r * 255, c.g * 255, c.b * 255)
+end
+
+-- Right-click context menu for a character row. EasyMenu has been flaky in
+-- current Classic Era so we drive UIDropDownMenu directly. Items are
+-- rebuilt each open so the enabled state of "force resync" / "claim"
+-- reflects the current pairing state.
+local charContextMenu = CreateFrame("Frame", "HelloStockCharContextMenu", UIParent, "UIDropDownMenuTemplate")
+charContextMenu.items = {}
+
+UIDropDownMenu_Initialize(charContextMenu, function(self, level)
+  for _, info in ipairs(self.items or {}) do
+    UIDropDownMenu_AddButton(info, level)
+  end
+end, "MENU")
+
+local function ShowCharContextMenu(row)
+  local entry = row.entry
+  if not entry then return end
+
+  local items = {}
+  items[#items + 1] = { text = entry.name .. "-" .. entry.realm, isTitle = true, notCheckable = true }
+
+  items[#items + 1] = {
+    text = "Forget",
+    notCheckable = true,
+    func = function()
+      if HelloStockDB and HelloStockDB.characters then
+        HelloStockDB.characters[entry.key] = nil
+        print(("|cffffd700HelloStock:|r removed %s-%s"):format(entry.name, entry.realm))
+      end
+      UI:Refresh()
+    end,
+  }
+  items[#items + 1] = { text = "|cffffd100" .. CANCEL .. "|r", notCheckable = true, func = function() end }
+
+  charContextMenu.items = items
+  ToggleDropDownMenu(1, nil, charContextMenu, "cursor", 0, 0)
+end
+
+-- Trade-skill orange used by Blizzard for profession tooltip headers.
+local PROF_COLOR_ORANGE = "ffd6873e"
+local PROF_COLOR_YELLOW = "ffffd100"
+local PROF_COLOR_GREEN  = "ff66ff66"
+
+-- Profession skill caps at 300 in Classic Era regardless of rank, so green
+-- means "truly maxed". 225 (Artisan rank trained, not yet maxed) is yellow,
+-- everything below is orange — including low-rank caps like 75/75 (which
+-- should read as "still has training to do" rather than "done").
+local function ProfTierColor(p)
+  local skill = p.skill or 0
+  if skill >= 300 then return PROF_COLOR_GREEN  end
+  if skill >= 225 then return PROF_COLOR_YELLOW end
+  return PROF_COLOR_ORANGE
+end
+
+local function BindCharRow(row, entry)
+  row.entry = entry
+  -- Reset alphas: rows are pooled, and the out-of-scope footer dims its rows
+  -- to 0.55 — without a reset that dimming sticks when the row is reused.
+  row.name:SetAlpha(1)
+  row.lastSync:SetAlpha(1)
+  row.gold:SetAlpha(1)
+  row.pending:SetAlpha(1)
+  row.professions:SetAlpha(1)
+
+  local classColor = ClassColorString(entry.class)
+  local levelTag = entry.level and ("|cffaaaaaa%d|r "):format(entry.level) or ""
+  row.name:SetText(("%s|c%s%s|r-%s%s"):format(
+    levelTag, classColor, entry.name, entry.realm,
+    entry.isMine and "" or "  |cff888888[paired]|r"))
+
+  row.lastSync:SetText(entry.isPending and "pending" or FormatRelTime(entry.lastSync))
+  row.lastSync:SetTextColor(RecencyColor(entry.isPending and 0 or entry.lastSync))
+
+  row.gold:SetText(CompactGold(entry.copper))
+  row.gold:SetTextColor(entry.copper > 0 and 1 or 0.6, entry.copper > 0 and 0.82 or 0.6, entry.copper > 0 and 0 or 0.6)
+
+  -- Pending = items sitting in this char's inbox + items being mailed to
+  -- them but not yet delivered. Anything they haven't taken into their bags.
+  -- Inline texture (rather than a Unicode envelope glyph) because WoW's
+  -- default fonts don't include U+2709 and render it as a tofu rectangle.
+  local pend = entry.pendingMail or 0
+  if pend > 0 then
+    row.pending:SetText(("|TInterface\\MailFrame\\Mail-Icon:14:14:0:0|t %d"):format(pend))
+    row.pending:SetTextColor(1, 0.82, 0)  -- yellow, attention-grabbing
+  else
+    row.pending:SetText("—")
+    row.pending:SetTextColor(0.5, 0.5, 0.5)
+  end
+
+  if entry.professions and #entry.professions > 0 then
+    local parts = {}
+    for _, p in ipairs(entry.professions) do
+      local color = ProfTierColor(p)
+      if p.skill and p.skill > 0 then
+        parts[#parts + 1] = ("|c%s%s %d|r"):format(color, p.name, p.skill)
+      else
+        parts[#parts + 1] = ("|c%s%s|r"):format(color, p.name)
+      end
+    end
+    row.professions:SetText(table.concat(parts, " |cff666666·|r "))
+  else
+    row.professions:SetText("|cff666666(no professions scanned)|r")
+  end
+
+  row:SetScript("OnClick", function(self, button)
+    if button == "RightButton" then ShowCharContextMenu(self) end
+  end)
+end
+
+local function RenderCharactersTab()
+  local inScope, outOfScope = addon:GetCharOverview()
+  local y, rIdx, hIdx = 0, 0, 0
+
+  -- Header: column titles.
+  hIdx = hIdx + 1
+  local h = MakeHeader(hIdx)
+  h.category = nil
+  h.arrow:Hide()
+  h.text:SetText("Character")
+  h.stockLabel:SetText("Last sync"); h.stockLabel:ClearAllPoints()
+  h.stockLabel:SetPoint("RIGHT", h, "RIGHT", -130, 0); h.stockLabel:Show()
+  h.gatherMidLabel:SetText("Gold"); h.gatherMidLabel:ClearAllPoints()
+  h.gatherMidLabel:SetPoint("RIGHT", h, "RIGHT", -55, 0); h.gatherMidLabel:Show()
+  h.targetLabel:SetText("Pending"); h.targetLabel:ClearAllPoints()
+  h.targetLabel:SetPoint("RIGHT", h, "RIGHT", -10, 0); h.targetLabel:Show()
+  h:ClearAllPoints()
+  h:SetPoint("TOPLEFT", 0, -y)
+  h:Show()
+  y = y + 22
+
+  if #inScope == 0 then
+    if not content.emptyMessage then
+      local fs = content:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+      fs:SetJustifyH("CENTER"); fs:SetWordWrap(true)
+      content.emptyMessage = fs
+    end
+    content.emptyMessage:ClearAllPoints()
+    content.emptyMessage:SetPoint("CENTER", scroll, "CENTER", 0, 0)
+    content.emptyMessage:SetWidth(scroll:GetWidth() - 40)
+    content.emptyMessage:SetTextColor(1, 0.82, 0)
+    content.emptyMessage:SetText("No tracked characters yet. Log into your alts (or pair an account) to populate this list.")
+    content.emptyMessage:Show()
+    content:SetHeight(math.max(scroll:GetHeight(), 1))
+    return
+  end
+
+  for _, entry in ipairs(inScope) do
+    rIdx = rIdx + 1
+    local row = MakeCharRow(rIdx)
+    BindCharRow(row, entry)
+    row:ClearAllPoints()
+    row:SetPoint("TOPLEFT", 0, -y)
+    row:Show()
+    y = y + CHAR_ROW_HEIGHT + 2
+  end
+
+  -- Out-of-scope characters (different faction / non-connected realm) are
+  -- deliberately hidden — when you're playing on a different cluster you
+  -- shouldn't see your other-side alts. They still exist in the DB and will
+  -- reappear when you log into a character that shares their scope.
+
+  content:SetHeight(math.max(y, 1))
+end
+
 function UI:Refresh()
-  syncBtn:SetShown(addon.GetSecret and addon:GetSecret() ~= nil)
   UpdateToggleAllTexture()
+  UpdateBottomTabSelection()
+  self:RefreshMoney()
 
   -- Defer refresh if the user is actively editing a target box. Hiding rows
   -- during the refresh would steal keyboard focus and route keys to the action
@@ -812,16 +1271,21 @@ function UI:Refresh()
     if r.targetBox and r.targetBox:HasFocus() then return end
   end
 
-  for _, r in ipairs(rowPool)    do r:Hide() end
-  for _, h in ipairs(headerPool) do h:Hide() end
+  for _, r in ipairs(rowPool)     do r:Hide() end
+  for _, r in ipairs(charRowPool) do r:Hide() end
+  for _, h in ipairs(headerPool)  do h:Hide() end
   if content.emptyMessage then content.emptyMessage:Hide() end
 
-  -- Filter checkboxes don't apply on the gather or craft tabs. The class
-  -- dropdown / toggle button only makes sense on the Consumables tab.
-  local listTab = currentTab == "To gather" or currentTab == "To craft"
+  -- Filter checkboxes don't apply on the meta tabs (gather / craft / chars).
+  -- The class dropdown / toggle button only makes sense on the Consumables
+  -- tab. The "Craftable" checkbox is the inverse: only meaningful on craft.
+  local listTab = currentTab == "To gather"
+              or currentTab == "To craft"
+              or currentTab == "Characters"
   stockCheck:SetShown(not listTab)
   targetsCheck:SetShown(not listTab)
   underCheck:SetShown(not listTab)
+  craftableCheck:SetShown(currentTab == "To craft")
   ApplyClassWidgetVisibility()
 
   if currentTab == "To gather" then
@@ -858,9 +1322,7 @@ function UI:Refresh()
       content.emptyMessage:SetPoint("CENTER", scroll, "CENTER", 0, 0)
       content.emptyMessage:SetWidth(scroll:GetWidth() - 40)
       local hasTargets = false
-      if HelloStockDB and HelloStockDB.targets then
-        for _ in pairs(HelloStockDB.targets) do hasTargets = true; break end
-      end
+      for _ in pairs(addon:GetTargets().items) do hasTargets = true; break end
       if hasTargets then
         content.emptyMessage:SetTextColor(0.4, 1, 0.4)  -- green
         content.emptyMessage:SetText("You have reached your target stock levels.")
@@ -959,6 +1421,7 @@ function UI:Refresh()
           row.stockHover:Hide()
           row.craftHover:Hide()
           row.boundLock:SetShown(addon:IsBoP(entry.id))
+          row.craftableBg:Hide()
           row.recipeKnown:Hide()
           row.connectorV:Hide()
           row.connectorH:Hide()
@@ -979,6 +1442,15 @@ function UI:Refresh()
     -- Mirrors the gather view but emits craftable items + a count of how many
     -- of each you'd need to make, including intermediates.
     local list = addon:ComputeCraftList()
+    if craftableOnly then
+      local filtered = {}
+      for _, entry in ipairs(list) do
+        if entry.craftLevel == "full" or entry.craftLevel == "half" then
+          filtered[#filtered + 1] = entry
+        end
+      end
+      list = filtered
+    end
     local y, rIdx, hIdx = 0, 0, 0
 
     if #list == 0 then
@@ -1006,10 +1478,11 @@ function UI:Refresh()
       content.emptyMessage:SetPoint("CENTER", scroll, "CENTER", 0, 0)
       content.emptyMessage:SetWidth(scroll:GetWidth() - 40)
       local hasTargets = false
-      if HelloStockDB and HelloStockDB.targets then
-        for _ in pairs(HelloStockDB.targets) do hasTargets = true; break end
-      end
-      if hasTargets then
+      for _ in pairs(addon:GetTargets().items) do hasTargets = true; break end
+      if craftableOnly then
+        content.emptyMessage:SetTextColor(1, 0.82, 0)
+        content.emptyMessage:SetText("Nothing craftable right now — uncheck \"Craftable\" to see what's missing.")
+      elseif hasTargets then
         content.emptyMessage:SetTextColor(0.4, 1, 0.4)
         content.emptyMessage:SetText("Nothing to craft — your targeted items are stocked or gather-only.")
       else
@@ -1106,6 +1579,15 @@ function UI:Refresh()
           row.stockHover:Show()
           row.craftHover:Show()
           row.boundLock:SetShown(addon:IsBoP(entry.id))
+          if entry.craftLevel == "full" then
+            row.craftableBg:SetColorTexture(0.2, 0.8, 0.2, 0.14)  -- green
+            row.craftableBg:Show()
+          elseif entry.craftLevel == "half" then
+            row.craftableBg:SetColorTexture(1.0, 0.82, 0.0, 0.12) -- yellow
+            row.craftableBg:Show()
+          else
+            row.craftableBg:Hide()
+          end
           local crafters = addon.GetCrafters and addon:GetCrafters(entry.id)
           row.recipeKnown:SetShown(crafters and #crafters > 0 or false)
           row.connectorV:Hide()
@@ -1120,6 +1602,11 @@ function UI:Refresh()
     end
 
     content:SetHeight(math.max(y, 1))
+    return
+  end
+
+  if currentTab == "Characters" then
+    RenderCharactersTab()
     return
   end
 
@@ -1187,6 +1674,7 @@ function UI:Refresh()
             row.count:Hide()
             row.targetBox:Hide()
             row.boundLock:Hide()
+            row.craftableBg:Hide()
             row.recipeKnown:Hide()
             row.connectorV:Hide()
             row.connectorH:Hide()
@@ -1216,6 +1704,7 @@ function UI:Refresh()
             row.icon:ClearAllPoints()
             row.icon:SetPoint("LEFT", item.indent and 20 or 4, 0)
             row.boundLock:SetShown(addon:IsBoP(item.id))
+            row.craftableBg:Hide()
             row.recipeKnown:Hide()
             local showBracket = item.indent == "branch"
             row.connectorV:SetShown(showBracket)

@@ -36,7 +36,14 @@ local function AppendStockpile(tooltip)
     for _, b in ipairs(breakdown) do
       local r, g, bl = 1, 1, 1
       if not b.isMine then r, g, bl = 0.6, 0.6, 0.6 end
-      tooltip:AddDoubleLine("  " .. b.name, b.count, r, g, bl, 1, 1, 1)
+      local right = tostring(b.count)
+      if b.transit and b.transit > 0 then
+        right = right .. (" |cffd8b66f(%d in transit)|r"):format(b.transit)
+      end
+      if b.mail and b.mail > 0 then
+        right = right .. (" |cff88aaee(%d in mail)|r"):format(b.mail)
+      end
+      tooltip:AddDoubleLine("  " .. b.name, right, r, g, bl, 1, 1, 1)
     end
   end
 

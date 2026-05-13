@@ -23,9 +23,26 @@ minimapCheck:SetScript("OnClick", function(self)
   end
 end)
 
+-- Auto-add paired-account characters to friends list. Off by default;
+-- toggling on syncs immediately, and SyncPeerFriends also runs after
+-- PLAYER_LOGIN and on each peer-snapshot receive.
+local autoFriendCheck = CreateFrame("CheckButton", "HelloStockOptAutoFriend", panel, "InterfaceOptionsCheckButtonTemplate")
+autoFriendCheck:SetPoint("TOPLEFT", minimapCheck, "BOTTOMLEFT", 0, -4)
+_G["HelloStockOptAutoFriendText"]:SetText("Add paired-account characters to friends list automatically")
+autoFriendCheck:SetScript("OnClick", function(self)
+  HelloStockDB = HelloStockDB or {}
+  HelloStockDB.autoFriendPeers = self:GetChecked() and true or false
+  if HelloStockDB.autoFriendPeers and addon.SyncPeerFriends then
+    local n = addon:SyncPeerFriends()
+    if n > 0 then
+      print(("|cffffd700HelloStock:|r added %d paired character(s) to your friends list."):format(n))
+    end
+  end
+end)
+
 -- Debug logging
 local debugCheck = CreateFrame("CheckButton", "HelloStockOptDebug", panel, "InterfaceOptionsCheckButtonTemplate")
-debugCheck:SetPoint("TOPLEFT", minimapCheck, "BOTTOMLEFT", 0, -4)
+debugCheck:SetPoint("TOPLEFT", autoFriendCheck, "BOTTOMLEFT", 0, -4)
 _G["HelloStockOptDebugText"]:SetText("Enable debug logging in chat")
 debugCheck:SetScript("OnClick", function(self)
   HelloStockDB = HelloStockDB or {}
@@ -79,9 +96,18 @@ dataHeader:SetText("Data")
 local dataCount = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
 dataCount:SetPoint("TOPLEFT", dataHeader, "BOTTOMLEFT", 0, -8)
 
+-- Reset only the current (faction, connected-realm) scope: drops every
+-- character snapshot and target on that scope, leaves the rest of the DB
+-- untouched. Slash equivalent: /hs resetscope.
+local resetScopeBtn = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
+resetScopeBtn:SetSize(150, 22)
+resetScopeBtn:SetPoint("TOPLEFT", dataCount, "BOTTOMLEFT", 0, -12)
+resetScopeBtn:SetText("Reset this scope")
+resetScopeBtn:SetScript("OnClick", function() StaticPopup_Show("HELLOSTOCK_RESET_SCOPE") end)
+
 local resetBtn = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
 resetBtn:SetSize(130, 22)
-resetBtn:SetPoint("TOPLEFT", dataCount, "BOTTOMLEFT", 0, -12)
+resetBtn:SetPoint("LEFT", resetScopeBtn, "RIGHT", 8, 0)
 resetBtn:SetText("Reset everything")
 resetBtn:SetScript("OnClick", function() StaticPopup_Show("HELLOSTOCK_RESET") end)
 
@@ -103,6 +129,7 @@ end
 
 local function Refresh()
   debugCheck:SetChecked(HelloStockDB and HelloStockDB.debug or false)
+  autoFriendCheck:SetChecked(HelloStockDB and HelloStockDB.autoFriendPeers or false)
   minimapCheck:SetChecked(addon.IsMinimapHidden and not addon:IsMinimapHidden() or true)
   accountLabel:SetText("Account ID: " .. (addon:GetAccountID() or "?"))
   local hash = addon:GetSecretHash()

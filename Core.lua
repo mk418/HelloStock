@@ -3,6 +3,15 @@ local _, addon = ...
 local BAG_IDS  = { 0, 1, 2, 3, 4 }
 local BANK_IDS = { -1, 5, 6, 7, 8, 9, 10, 11 }
 
+-- Vendor-purchasable reagents. Shortages of these don't block "can craft now"
+-- highlighting, since you can grab them from an alchemy/trade-supply vendor.
+local VENDOR_INGREDIENTS = {
+  [8925]  = true, -- Crystal Vial
+  [3372]  = true, -- Leaded Vial
+  [3371]  = true, -- Empty Vial
+  [22890] = true, -- Imbued Vial
+}
+
 local function CharKey(realm, faction, name)
   return realm .. ":" .. faction .. ":" .. name
 end
@@ -22,16 +31,29 @@ local function EnsureDB()
   local c = HelloStockDB.characters[key]
   if not c then
     c = {
-      bags = {}, bank = {}, bagsUpdated = 0, bankUpdated = 0,
+      bags = {}, bank = {}, mail = {},
+      bagsUpdated = 0, bankUpdated = 0, mailUpdated = 0,
+      mailMoney = 0,
+      money = 0,
     }
     HelloStockDB.characters[key] = c
   end
+  -- Money is account-shared currency in spirit but per-character in storage.
+  -- GetMoney returns copper; safe to call any time after login.
+  if GetMoney then c.money = GetMoney() end
   if playerName  and playerName  ~= "" then c.name    = playerName  end
   if playerRealm and playerRealm ~= "" then c.realm   = playerRealm end
   c.faction      = UnitFactionGroup("player") or "Neutral"
   c.accountID    = addon:GetAccountID()
   c.source       = "self"
   c.sourceSecret = nil
+  -- Class is captured for the Characters overview (class-coloured name) and
+  -- isn't otherwise used by aggregation. Token form ("WARRIOR", "MAGE", ...)
+  -- so it keys directly into RAID_CLASS_COLORS regardless of locale.
+  local _, classToken = UnitClass("player")
+  if classToken and classToken ~= "" then c.class = classToken end
+  local lvl = UnitLevel("player")
+  if lvl and lvl > 0 then c.level = lvl end
   return c
 end
 
@@ -64,6 +86,38 @@ function addon:IsBoP(itemID)
   if not itemID then return false end
   local _, _, _, _, _, _, _, _, _, _, _, _, _, bindType = GetItemInfo(itemID)
   return bindType == 1
+end
+
+-- Per-entry CRDT for the ignore list. Each entry stores the latest addedAt
+-- and removedAt timestamps independently; state is "ignored" iff
+-- addedAt > removedAt. Two-way sync merges max(local, peer) per field, so
+-- concurrent ignores or unignores from either side compose without loss.
+-- Keyed by case-insensitive "name-realm" so duplicate names across realms
+-- can be ignored independently.
+local function IgnoreKey(name, realm)
+  if not name or name == "" then return nil end
+  return name:lower() .. "-" .. addon:NormalizeRealm(realm or ""):lower()
+end
+
+-- Legacy entries (boolean true) migrate to a table form lazily. We use the
+-- legacy whole-list `ignoredUpdatedAt` as the addedAt timestamp so the
+-- entry's vintage is plausible; the user can re-ignore to refresh it.
+local function NormalizeIgnoreEntry(e, fallbackTs)
+  if type(e) == "table" then return e end
+  return { addedAt = fallbackTs or 0, removedAt = 0 }
+end
+
+function addon:IsIgnored(name, realm)
+  if not HelloStockDB or not HelloStockDB.ignored then return false end
+  local key = IgnoreKey(name, realm)
+  if not key then return false end
+  local e = HelloStockDB.ignored[key]
+  if not e then return false end
+  if type(e) ~= "table" then
+    e = NormalizeIgnoreEntry(e, HelloStockDB.ignoredUpdatedAt)
+    HelloStockDB.ignored[key] = e
+  end
+  return (e.addedAt or 0) > (e.removedAt or 0)
 end
 
 -- Recipe lookups, built lazily from addon.ITEMS the first time anything asks.
@@ -156,12 +210,13 @@ function addon:ComputeGatheringList()
   BuildRecipeMaps()
   BuildRoundUpMap()
 
+  local targets = self:GetTargets().items
   local demand = {}
   for _, section in pairs(addon.ITEMS) do
     for _, group in ipairs(section) do
       for _, item in ipairs(group.items) do
         if item.id then
-          local target = HelloStockDB and HelloStockDB.targets and HelloStockDB.targets[item.id]
+          local target = targets[item.id]
           if target and target > 0 then
             demand[item.id] = (demand[item.id] or 0) + target
           end
@@ -233,12 +288,13 @@ function addon:ComputeCraftList()
   if not addon.ITEMS then return out end
   BuildRecipeMaps()
 
+  local targets = self:GetTargets().items
   local demand = {}
   for _, section in pairs(addon.ITEMS) do
     for _, group in ipairs(section) do
       for _, item in ipairs(group.items) do
         if item.id then
-          local target = HelloStockDB and HelloStockDB.targets and HelloStockDB.targets[item.id]
+          local target = targets[item.id]
           if target and target > 0 then
             demand[item.id] = (demand[item.id] or 0) + target
           end
@@ -274,6 +330,32 @@ function addon:ComputeCraftList()
     end
   end
 
+  -- Max units of `id` we could end up with from current stocks, recursively
+  -- crafting any intermediates whose recipes we know. Vendor ingredients are
+  -- treated as unlimited. Per-row view: assumes nothing else competes for the
+  -- same raw materials, which matches how the tooltip reads each row in
+  -- isolation.
+  local maxCache = {}
+  local function MaxProducible(id)
+    if VENDOR_INGREDIENTS[id] then return math.huge end
+    if maxCache[id] ~= nil then return maxCache[id] end
+    maxCache[id] = 0  -- cycle guard
+    local have = self:GetTotals(id)
+    local r    = recipeMap[id]
+    if r then
+      local yield  = r.yield or 1
+      local crafts = math.huge
+      for _, ing in ipairs(r) do
+        local possible = math.floor(MaxProducible(ing.id) / ing.count)
+        if possible < crafts then crafts = possible end
+      end
+      if crafts == math.huge then crafts = 0 end
+      have = have + crafts * yield
+    end
+    maxCache[id] = have
+    return have
+  end
+
   for id, needed in pairs(demand) do
     if recipeMap[id] then
       local r      = recipeMap[id]
@@ -283,14 +365,32 @@ function addon:ComputeCraftList()
       if rawNet > 0 then
         local crafts = math.ceil(rawNet / yield)
         local craft  = crafts * yield
+
+        local maxCrafts = math.huge
+        for _, ing in ipairs(r) do
+          if not VENDOR_INGREDIENTS[ing.id] then
+            local possible = math.floor(MaxProducible(ing.id) / ing.count)
+            if possible < maxCrafts then maxCrafts = possible end
+          end
+        end
+        if maxCrafts == math.huge then maxCrafts = crafts end
+        local doable = math.min(crafts, maxCrafts)
+        local ratio  = crafts > 0 and doable / crafts or 0
+        local craftLevel = "none"
+        if ratio >= 1     then craftLevel = "full"
+        elseif ratio >= 0.5 then craftLevel = "half" end
+
         out[#out + 1] = {
-          id       = id,
-          craft    = craft,
-          crafts   = crafts,
-          yield    = yield,
-          have     = have,
-          needed   = have + craft,
-          category = self:GetItemCategory(id),
+          id         = id,
+          craft      = craft,
+          crafts     = crafts,
+          yield      = yield,
+          have       = have,
+          needed     = have + craft,
+          doable     = doable,
+          canCraft   = craftLevel == "full",
+          craftLevel = craftLevel,
+          category   = self:GetItemCategory(id),
         }
       end
     end
@@ -317,6 +417,40 @@ local function MarkCanCraft(itemID)
   return true
 end
 
+-- Reverse lookup: localized item name → tracked itemID. Built lazily because
+-- GetItemInfo needs the item to be in the cache (PrimeItemCache on login
+-- usually handles that). Used as a fallback when the trade-skill / craft
+-- API returns an enchant/spell link instead of the expected item link —
+-- which happens for Enchanting "produce an item" recipes like Wizard Oils.
+local nameToID
+local function NameToID()
+  if nameToID then return nameToID end
+  nameToID = {}
+  if not addon.ITEMS then return nameToID end
+  for _, section in pairs(addon.ITEMS) do
+    for _, group in ipairs(section) do
+      for _, item in ipairs(group.items) do
+        if item.id then
+          local n = GetItemInfo(item.id) or item.name
+          if n and n ~= "" then nameToID[n] = item.id end
+        end
+      end
+    end
+  end
+  return nameToID
+end
+
+local function ResolveItemID(link, skillName)
+  if link then
+    local id = tonumber(link:match("item:(%d+)"))
+    if id then return id end
+  end
+  if skillName then
+    return NameToID()[skillName]
+  end
+  return nil
+end
+
 local function ScanTradeSkillsNow()
   if not GetNumTradeSkills then return false end
   local changed = false
@@ -328,10 +462,10 @@ local function ScanTradeSkillsNow()
     end
   end
   for i = 1, (GetNumTradeSkills() or 0) do
-    local _, skillType = GetTradeSkillInfo(i)
-    if skillType and skillType ~= "header" and GetTradeSkillItemLink then
-      local link = GetTradeSkillItemLink(i)
-      local id   = link and tonumber(link:match("item:(%d+)"))
+    local skillName, skillType = GetTradeSkillInfo(i)
+    if skillType and skillType ~= "header" then
+      local link = GetTradeSkillItemLink and GetTradeSkillItemLink(i)
+      local id   = ResolveItemID(link, skillName)
       if id and MarkCanCraft(id) then changed = true end
     end
   end
@@ -348,10 +482,10 @@ local function ScanCraftsNow()
     end
   end
   for i = 1, (GetNumCrafts() or 0) do
-    local _, _, craftType = GetCraftInfo(i)
-    if craftType and craftType ~= "header" and GetCraftItemLink then
-      local link = GetCraftItemLink(i)
-      local id   = link and tonumber(link:match("item:(%d+)"))
+    local craftName, _, craftType = GetCraftInfo(i)
+    if craftType and craftType ~= "header" then
+      local link = GetCraftItemLink and GetCraftItemLink(i)
+      local id   = ResolveItemID(link, craftName)
       if id and MarkCanCraft(id) then changed = true end
     end
   end
@@ -404,26 +538,375 @@ local function UpdateBank()
   Broadcast()
 end
 
+local function UpdateMoney()
+  local c = EnsureDB()
+  c.money = GetMoney() or 0
+  RefreshUI()
+  Broadcast()
+end
+
+-- Profession identification has two failure modes worth dodging:
+--  - The Apprentice spell ID isn't necessarily known at higher ranks
+--    (Mining = 2575 is Apprentice; Artisan = 29354 replaces it).
+--  - GetSpellInfo on the spell ID returns the *action* name, which can differ
+--    from the *skill* name shown in the panel (e.g. "Herb Gathering" spell
+--    vs "Herbalism" skill line).
+-- So the primary signal is now the skill panel itself, walked by section
+-- header. Spell-ID lookups are kept only as a localization-friendly seed for
+-- known-name matching, in case the section header is also localized away.
+local PROFESSION_APPRENTICE_SPELL_IDS = {
+  2259,  -- Alchemy
+  2018,  -- Blacksmithing
+  2550,  -- Cooking
+  7411,  -- Enchanting
+  4036,  -- Engineering
+  3273,  -- First Aid
+  7620,  -- Fishing
+  2366,  -- Herb Gathering  (note: spell name ≠ "Herbalism" skill name)
+  2108,  -- Leatherworking
+  2575,  -- Mining
+  8613,  -- Skinning
+  3908,  -- Tailoring
+}
+
+local PROFESSION_SKILL_NAMES_EN = {
+  Alchemy = true, Blacksmithing = true, Cooking = true, Enchanting = true,
+  Engineering = true, ["First Aid"] = true, Fishing = true, Herbalism = true,
+  Leatherworking = true, Mining = true, Skinning = true, Tailoring = true,
+}
+
+local function ScanProfessions()
+  -- Header strings that mark the *Professions* section specifically.
+  -- "Secondary Skills" is deliberately excluded — it also contains Riding /
+  -- racial mount skills which we don't want in the overview. Cooking, First
+  -- Aid, and Fishing still get captured via the known-name allowlist below.
+  local profHeaders = { ["Professions"] = true }
+  if _G.TRADESKILLS then profHeaders[_G.TRADESKILLS] = true end
+
+  -- Known-name set: English profession names + the localized action names
+  -- pulled from spell IDs. Acts as a safety net so e.g. a German client with
+  -- a non-matching section header still picks up Mining via its localized
+  -- spell name.
+  local knownNames = {}
+  for n in pairs(PROFESSION_SKILL_NAMES_EN) do knownNames[n] = true end
+  for _, id in ipairs(PROFESSION_APPRENTICE_SPELL_IDS) do
+    local n = GetSpellInfo and GetSpellInfo(id)
+    if n and n ~= "" then knownNames[n] = true end
+  end
+
+  local out, seen = {}, {}
+  local inSection = false
+  local total = (GetNumSkillLines and GetNumSkillLines()) or 0
+  for i = 1, total do
+    local name, isHeader, _, rank, _, _, maxRank = GetSkillLineInfo(i)
+    if name then
+      if isHeader then
+        inSection = profHeaders[name] == true
+      else
+        if (inSection or knownNames[name]) and not seen[name] then
+          seen[name] = true
+          out[#out + 1] = { name = name, skill = rank or 0, max = maxRank or 0 }
+        end
+      end
+    end
+  end
+  return out
+end
+
+local function UpdateProfessions()
+  local c = EnsureDB()
+  local result = ScanProfessions()
+  -- Skip the write when the scan came back empty but a previous scan
+  -- captured something — protects against transient spellbook-not-ready
+  -- failures clobbering known data on /reload.
+  if #result == 0 and c.professions and #c.professions > 0 then return end
+  c.professions = result
+  RefreshUI()
+  Broadcast()
+end
+
+-- Scan the player's inbox for tracked items sitting in mail (received or
+-- still-in-transit attachments) plus any copper attached but not yet taken.
+-- Returns (counts, money): counts mirrors the { [itemID] = count } shape used
+-- by bag/bank scans; money is total copper across all messages.
+local function ScanMail()
+  local counts = {}
+  local money = 0
+  local tracked = TrackedItemSet()
+  local num = GetInboxNumItems and GetInboxNumItems() or 0
+  local maxAttach = ATTACHMENTS_MAX_RECEIVE or 16
+  for i = 1, num do
+    local _, _, _, _, mailMoney = GetInboxHeaderInfo(i)
+    money = money + (mailMoney or 0)
+    for a = 1, maxAttach do
+      local link = GetInboxItemLink and GetInboxItemLink(i, a)
+      if link then
+        local id = tonumber(link:match("item:(%d+)"))
+        if id and tracked[id] then
+          local _, _, _, count = GetInboxItem(i, a)
+          counts[id] = (counts[id] or 0) + (count or 1)
+        end
+      end
+    end
+  end
+  return counts, money
+end
+
+-- Outgoing mail. WoW puts mail "in transit" for an hour between send and
+-- arrival; items are gone from the sender's bags but not yet in the
+-- recipient's inbox. We capture sends to characters we already know about
+-- (own account or paired peer, same faction) so the stockpile total doesn't
+-- briefly drop while the items are on the wire.
+local MAIL_TRANSIT_SECS  = 60 * 60        -- WoW's delivery delay
+local OUTBOX_HARD_CAP    = 30 * 24 * 3600 -- WoW auto-returns mail after 30 days
+
+local function FindCharByName(name, faction)
+  if not name or name == "" then return nil end
+  if not HelloStockDB or not HelloStockDB.characters then return nil end
+  local bare = name:match("^([^%-]+)") or name
+  for _, c in pairs(HelloStockDB.characters) do
+    if c.name == bare and c.faction == faction then return c end
+  end
+  return nil
+end
+
+-- True if `name` matches a stored character on our current faction. Used to
+-- decide whether a send is "internal" (worth tracking) or external (truly
+-- gone from our pool).
+local function IsKnownChar(name)
+  return FindCharByName(name, UnitFactionGroup("player") or "Neutral") ~= nil
+end
+
+-- Drop a transit entry only after the recipient's own mail snapshot proves
+-- they've scanned their inbox since the item arrived. Before that — even
+-- past WoW's 1-hour delivery time — we keep showing it as in-transit so the
+-- item never disappears from the addon's totals just because the recipient
+-- hasn't logged in yet. A 30-day hard cap matches WoW's auto-return behavior
+-- and keeps the list from accumulating forever in pathological cases.
+local function ShouldExpire(entry, faction)
+  if not entry.sentAt then return true end
+  local age = time() - entry.sentAt
+  if age >= OUTBOX_HARD_CAP then return true end
+  if age < MAIL_TRANSIT_SECS then return false end
+  local recipient = FindCharByName(entry.to, faction)
+  if not recipient then return false end
+  return (recipient.mailUpdated or 0) >= entry.sentAt + MAIL_TRANSIT_SECS
+end
+
+local function ExpireOutbox(outbox, faction)
+  if not outbox then return outbox end
+  local kept = {}
+  for _, e in ipairs(outbox) do
+    if not ShouldExpire(e, faction) then
+      kept[#kept + 1] = e
+    end
+  end
+  return kept
+end
+
+local function UpdateMail()
+  local c = EnsureDB()
+  local counts, money = ScanMail()
+  c.mail = counts
+  c.mailMoney = money
+  c.mailUpdated = time()
+  RefreshUI()
+  Broadcast()
+end
+
 function addon:GetSelf()
   if not HelloStockDB or not HelloStockDB.characters then return nil end
   return HelloStockDB.characters[MyKey()]
 end
 
+-- Capture outgoing mail at the moment Send is clicked. Hooked lazily on the
+-- first MAIL_SHOW because the SendMail UI lives in Blizzard_MailUI, which is
+-- load-on-demand. PreClick reads GetSendMailItem before the action clears
+-- the attachments; MAIL_SEND_SUCCESS commits the snapshot.
+local mailHookInstalled = false
+local pendingSend = nil
+
+-- Note: Blizzard's "send mail to a stranger" warning lives on the
+-- protected `SecureTransferDialog` frame. Addons can't auto-confirm it
+-- without tainting the call stack (by design — it's an anti-abuse gate
+-- for player-to-player transfers). The recipient picker below at least
+-- makes the typing-the-name step easy; the popup itself is unavoidable.
+local function InstallMailHooks()
+  if mailHookInstalled then return end
+  if not SendMailMailButton then return end
+  mailHookInstalled = true
+  SendMailMailButton:HookScript("PreClick", function()
+    pendingSend = nil
+    local recipient = SendMailNameEditBox and SendMailNameEditBox:GetText() or ""
+    if not IsKnownChar(recipient) then return end
+    local items = {}
+    local tracked = TrackedItemSet()
+    local maxSend = ATTACHMENTS_MAX_SEND or 12
+    for slot = 1, maxSend do
+      local link = GetSendMailItemLink and GetSendMailItemLink(slot)
+      if link then
+        local id = tonumber(link:match("item:(%d+)"))
+        if id and tracked[id] then
+          local _, _, _, count = GetSendMailItem(slot)
+          items[#items + 1] = { id = id, count = count or 1 }
+        end
+      end
+    end
+    local money = 0
+    if MoneyInputFrame_GetCopper and SendMailMoney then
+      money = MoneyInputFrame_GetCopper(SendMailMoney) or 0
+    end
+    if #items > 0 or money > 0 then
+      pendingSend = { to = recipient, items = items, money = money }
+    end
+  end)
+
+  -- Recipient picker: a small "Alts" button next to the To: field that
+  -- opens a menu of tracked characters in the current scope. Clicking a
+  -- name fills SendMailNameEditBox so the user doesn't have to type names.
+  if SendMailNameEditBox and not _G.HelloStock_MailRecipientPicker then
+    -- Small icon-only button right next to the To: field. Compact enough
+    -- not to collide with the Postage label on the same row. Tooltip on
+    -- hover explains what it does.
+    local btn = CreateFrame("Button", "HelloStock_MailRecipientPicker", SendMailFrame)
+    btn:SetSize(16, 16)
+    btn:SetPoint("LEFT", SendMailNameEditBox, "RIGHT", 2, 0)
+
+    btn:SetNormalTexture("Interface\\Icons\\Achievement_Reputation_01")
+    local nt = btn:GetNormalTexture()
+    if nt then nt:SetTexCoord(0.08, 0.92, 0.08, 0.92) end
+    btn:SetPushedTexture("Interface\\Icons\\Achievement_Reputation_01")
+    local pt = btn:GetPushedTexture()
+    if pt then pt:SetTexCoord(0.08, 0.92, 0.08, 0.92) end
+    btn:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square", "ADD")
+
+    -- Subtle bevel border around the icon so it reads as clickable.
+    local border = btn:CreateTexture(nil, "OVERLAY")
+    border:SetTexture("Interface\\Buttons\\UI-Quickslot2")
+    border:SetTexCoord(0.2, 0.8, 0.2, 0.8)
+    border:SetSize(22, 22)
+    border:SetPoint("CENTER", 0, 0)
+
+    btn:SetScript("OnEnter", function(self)
+      GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+      GameTooltip:SetText("HelloStock: tracked characters", 1, 1, 1)
+      GameTooltip:AddLine("Click to pick a recipient from your tracked characters.", 0.7, 0.7, 0.7, true)
+      GameTooltip:Show()
+    end)
+    btn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+    local menu = CreateFrame("Frame", "HelloStock_MailRecipientMenu", UIParent, "UIDropDownMenuTemplate")
+    menu.items = {}
+    UIDropDownMenu_Initialize(menu, function(self, level)
+      for _, info in ipairs(self.items or {}) do
+        UIDropDownMenu_AddButton(info, level)
+      end
+    end, "MENU")
+
+    btn:SetScript("OnClick", function()
+      local myFaction = UnitFactionGroup("player") or "Neutral"
+      local realmSet  = addon:ConnectedRealmSet()
+      local myID      = addon:GetAccountID()
+      local myName    = UnitName("player")
+      local myRealm   = GetRealmName() or ""
+
+      local mine, peer = {}, {}
+      for _, c in pairs(HelloStockDB and HelloStockDB.characters or {}) do
+        local sameScope = c.faction == myFaction and c.realm
+                       and realmSet[addon:NormalizeRealm(c.realm)]
+        local notSelf   = not (c.name == myName and c.realm == myRealm)
+        local notIgnored = not addon:IsIgnored(c.name, c.realm)
+        if sameScope and notSelf and notIgnored and c.name and c.name ~= "" then
+          local entry = { name = c.name, realm = c.realm }
+          if c.accountID == myID then mine[#mine + 1] = entry
+          else peer[#peer + 1] = entry end
+        end
+      end
+      table.sort(mine, function(a, b) return a.name < b.name end)
+      table.sort(peer, function(a, b) return a.name < b.name end)
+
+      local items = {}
+      items[#items + 1] = { text = "Mail to a tracked character", isTitle = true, notCheckable = true }
+      local function addSection(label, list)
+        if #list == 0 then return end
+        items[#items + 1] = { text = label, isTitle = true, notCheckable = true }
+        for _, c in ipairs(list) do
+          local normalized = c.name .. "-" .. addon:NormalizeRealm(c.realm)
+          items[#items + 1] = {
+            text = c.name .. "-" .. c.realm,  -- pretty form for the menu
+            notCheckable = true,
+            func = function()
+              -- Mail recipient lookup expects the realm with whitespace
+              -- stripped (e.g. "OldBlanchy", not "Old Blanchy"), otherwise
+              -- the server rejects the send with "No player named …".
+              SendMailNameEditBox:SetText(normalized)
+              SendMailNameEditBox:SetCursorPosition(#SendMailNameEditBox:GetText())
+            end,
+          }
+        end
+      end
+      addSection("Your characters", mine)
+      addSection("Paired account",  peer)
+      if #mine == 0 and #peer == 0 then
+        items[#items + 1] = { text = "(none in scope)", disabled = true, notCheckable = true }
+      end
+      items[#items + 1] = { text = "|cffffd100" .. CANCEL .. "|r", notCheckable = true, func = function() end }
+
+      menu.items = items
+      ToggleDropDownMenu(1, nil, menu, btn, 0, 0)
+    end)
+  end
+end
+
+function addon:ReceiveIgnoreList(snap)
+  HelloStockDB = HelloStockDB or {}
+  HelloStockDB.ignored = HelloStockDB.ignored or {}
+  local merged = 0
+  for _, e in ipairs(snap.entries or {}) do
+    if e.key and e.key ~= "" then
+      local localEntry = NormalizeIgnoreEntry(HelloStockDB.ignored[e.key], HelloStockDB.ignoredUpdatedAt)
+      HelloStockDB.ignored[e.key] = {
+        addedAt   = math.max(localEntry.addedAt or 0, e.addedAt or 0),
+        removedAt = math.max(localEntry.removedAt or 0, e.removedAt or 0),
+      }
+      merged = merged + 1
+    end
+  end
+  -- Prune characters that newly match the merged ignore list, mirroring
+  -- the on-disk wipe that /hs ignore does locally.
+  if HelloStockDB.characters then
+    for k, c in pairs(HelloStockDB.characters) do
+      if self:IsIgnored(c.name, c.realm) then
+        HelloStockDB.characters[k] = nil
+      end
+    end
+  end
+  if HelloStockDB.debug then
+    print(("|cff888888[HS recv]|r ignored merged (%d entries)"):format(merged))
+  end
+  if addon.UI and addon.UI:IsShown() then addon.UI:Refresh() end
+end
+
 function addon:ReceiveTargets(snap)
   HelloStockDB = HelloStockDB or {}
-  HelloStockDB.targets = HelloStockDB.targets or {}
-  local localTs = HelloStockDB.targetsUpdatedAt or 0
+  -- Sync only ever reaches characters within the same scope (faction +
+  -- connected-realm), so the incoming payload belongs in our current scope's
+  -- target bucket. ScopeKey-on-snap could be carried in the payload for
+  -- defense-in-depth, but the Comm layer already filters by faction+realm
+  -- before the snapshot is delivered here.
+  local bucket = self:GetTargets()
+  local localTs = bucket.updatedAt or 0
   if (snap.ts or 0) <= localTs then
     if HelloStockDB.debug then
       print(("|cffaa3333[HS drop]|r targets: incoming ts %d not newer than %d"):format(snap.ts or 0, localTs))
     end
     return
   end
-  HelloStockDB.targets = snap.targets or {}
-  HelloStockDB.targetsUpdatedAt = snap.ts
+  bucket.items     = snap.targets or {}
+  bucket.updatedAt = snap.ts
   if HelloStockDB.debug then
     local n = 0
-    for _ in pairs(HelloStockDB.targets) do n = n + 1 end
+    for _ in pairs(bucket.items) do n = n + 1 end
     print(("|cff888888[HS recv]|r targets (%d entries, ts %d)"):format(n, snap.ts))
   end
   if addon.UI and addon.UI:IsShown() then addon.UI:Refresh() end
@@ -432,6 +915,17 @@ end
 function addon:ReceiveSnapshot(snap, senderHash)
   HelloStockDB = HelloStockDB or {}
   HelloStockDB.characters = HelloStockDB.characters or {}
+
+  -- Drop snapshots from ignored characters before doing anything else.
+  -- /hs ignore wiped their on-disk record; we don't want the next inbound
+  -- broadcast to recreate it.
+  if self:IsIgnored(snap.name, snap.realm) then
+    if HelloStockDB.debug then
+      print(("|cffaa3333[HS drop]|r %s-%s: character is on the ignore list")
+        :format(tostring(snap.name), tostring(snap.realm)))
+    end
+    return
+  end
 
   local key = CharKey(snap.realm, snap.faction, snap.name)
   local existing = HelloStockDB.characters[key]
@@ -453,20 +947,35 @@ function addon:ReceiveSnapshot(snap, senderHash)
   end
   local isMine = (incomingAcct == myID)
   HelloStockDB.characters[key] = {
-    name         = snap.name,
-    realm        = snap.realm,
-    faction      = snap.faction,
-    accountID    = incomingAcct,
-    bags         = snap.bags or {},
-    bank         = snap.bank or {},
-    crafts       = snap.crafts or {},
-    bagsUpdated  = snap.ts or 0,
-    bankUpdated  = snap.ts or 0,
-    source       = isMine and "self" or "sync",
-    sourceSecret = isMine and nil or senderHash,
+    name          = snap.name,
+    realm         = snap.realm,
+    faction       = snap.faction,
+    accountID     = incomingAcct,
+    bags          = snap.bags or {},
+    bank          = snap.bank or {},
+    mail          = snap.mail or (existing and existing.mail) or {},
+    mailMoney     = snap.mailMoney or (existing and existing.mailMoney) or 0,
+    outbox        = ExpireOutbox(snap.outbox or (existing and existing.outbox) or {}, snap.faction),
+    moneyOutbox   = ExpireOutbox(snap.moneyOutbox or (existing and existing.moneyOutbox) or {}, snap.faction),
+    class         = snap.class or (existing and existing.class) or nil,
+    level         = snap.level or (existing and existing.level) or nil,
+    professions   = snap.professions or (existing and existing.professions) or nil,
+    crafts        = snap.crafts or {},
+    money         = snap.money or (existing and existing.money) or 0,
+    bagsUpdated   = snap.ts or 0,
+    bankUpdated   = snap.ts or 0,
+    mailUpdated   = snap.mailUpdated or (existing and existing.mailUpdated) or 0,
+    outboxUpdated = snap.outboxUpdated or (existing and existing.outboxUpdated) or 0,
+    source        = isMine and "self" or "sync",
+    sourceSecret  = isMine and nil or senderHash,
   }
   RefreshUI()
   if self.RefreshOptions then self:RefreshOptions() end
+  -- If auto-friend is on and we just learned about a peer character,
+  -- nudge the friends list sync so they appear there too.
+  if not isMine and HelloStockDB.autoFriendPeers and self.SyncPeerFriends then
+    self:SyncPeerFriends()
+  end
 end
 
 function addon:NormalizeRealm(name)
@@ -486,6 +995,56 @@ function addon:ConnectedRealmSet()
 end
 
 local function ConnectedRealmSet() return addon:ConnectedRealmSet() end
+
+-- Scope key identifies the (faction, connected-realm-cluster) pair the
+-- current character belongs to. Used to scope state (targets, etc.) so
+-- logging onto a different cluster or the opposing faction doesn't leak
+-- data across boundaries. Stable for as long as Blizzard keeps the cluster
+-- composition stable; if a server merge changes the cluster, scope keys
+-- shift and pre-merge targets appear in a now-orphan bucket — acceptable
+-- given how rare that is.
+function addon:ScopeKey()
+  local faction = UnitFactionGroup("player") or "Neutral"
+  local realms, seen = {}, {}
+  for r in pairs(self:ConnectedRealmSet()) do
+    if not seen[r] then
+      seen[r] = true
+      realms[#realms + 1] = r
+    end
+  end
+  table.sort(realms)
+  return faction .. "@" .. table.concat(realms, ",")
+end
+
+-- Lazy-migrating accessor for the current scope's target bucket. First call
+-- after upgrading from a pre-scoped build moves the legacy flat
+-- HelloStockDB.targets / .targetsUpdatedAt into the current scope's bucket
+-- (the assumption being that whatever you set them to lives on this side).
+function addon:GetTargets()
+  HelloStockDB = HelloStockDB or {}
+  HelloStockDB.targetsByScope = HelloStockDB.targetsByScope or {}
+  if HelloStockDB.targets and next(HelloStockDB.targets) ~= nil then
+    local key = self:ScopeKey()
+    HelloStockDB.targetsByScope[key] = HelloStockDB.targetsByScope[key] or {
+      items     = HelloStockDB.targets,
+      updatedAt = HelloStockDB.targetsUpdatedAt or time(),
+    }
+    HelloStockDB.targets = nil
+    HelloStockDB.targetsUpdatedAt = nil
+  elseif HelloStockDB.targets then
+    -- Empty legacy table — drop it without migrating.
+    HelloStockDB.targets = nil
+    HelloStockDB.targetsUpdatedAt = nil
+  end
+  local key = self:ScopeKey()
+  local entry = HelloStockDB.targetsByScope[key]
+  if not entry then
+    entry = { items = {}, updatedAt = 0 }
+    HelloStockDB.targetsByScope[key] = entry
+  end
+  entry.items = entry.items or {}
+  return entry
+end
 
 -- List of characters (in same-faction + connected-realm scope) that know how
 -- to craft itemID. Each entry: { name = "Char-Realm", isMine = bool }.
@@ -518,21 +1077,248 @@ function addon:GetTotals(itemID)
   local realmSet  = ConnectedRealmSet()
   local myID      = self:GetAccountID()
 
+  local function InScope(c)
+    return c.faction == myFaction
+       and c.realm
+       and realmSet[addon:NormalizeRealm(c.realm)]
+  end
+
+  -- Build one entry per character lazily, so a recipient that holds nothing
+  -- but is receiving an in-transit item still shows up as a row.
+  local entries = {}
+  local function EntryFor(c)
+    local key = CharKey(c.realm, c.faction, c.name)
+    local e = entries[key]
+    if not e then
+      e = {
+        name    = (c.name or "?") .. "-" .. (c.realm or "?"),
+        count   = 0,
+        mail    = 0,
+        transit = 0,
+        isMine  = c.accountID == myID,
+      }
+      entries[key] = e
+    end
+    return e
+  end
+
   for _, c in pairs(HelloStockDB.characters) do
-    if c.faction == myFaction and c.realm and realmSet[addon:NormalizeRealm(c.realm)] then
-      local n = (c.bags and c.bags[itemID] or 0) + (c.bank and c.bank[itemID] or 0)
-      if n > 0 then
-        total = total + n
-        breakdown[#breakdown + 1] = {
-          name   = (c.name or "?") .. "-" .. (c.realm or "?"),
-          count  = n,
-          isMine = c.accountID == myID,
-        }
+    if InScope(c) and not self:IsIgnored(c.name, c.realm) then
+      local bags = c.bags and c.bags[itemID] or 0
+      local bank = c.bank and c.bank[itemID] or 0
+      local mail = c.mail and c.mail[itemID] or 0
+      if bags + bank + mail > 0 then
+        local e = EntryFor(c)
+        e.count = e.count + bags + bank + mail
+        e.mail  = e.mail + mail
       end
     end
   end
+
+  -- Outbox lives on the sender's record but the item is heading to someone
+  -- else — attribute the in-transit count to the recipient instead. Falls
+  -- back to the sender only when the recipient is out of scope (e.g. their
+  -- snapshot hasn't been received yet, or they're on a connected realm we
+  -- don't recognise), so the item never disappears from the totals.
+  for _, sender in pairs(HelloStockDB.characters) do
+    if sender.outbox and not self:IsIgnored(sender.name, sender.realm) then
+      sender.outbox = ExpireOutbox(sender.outbox, sender.faction)
+      for _, oe in ipairs(sender.outbox) do
+        if oe.id == itemID then
+          local recipient = FindCharByName(oe.to, sender.faction)
+          local attribTo  = (recipient and InScope(recipient)) and recipient or sender
+          if InScope(attribTo) and not self:IsIgnored(attribTo.name, attribTo.realm) then
+            local e = EntryFor(attribTo)
+            e.count   = e.count   + (oe.count or 0)
+            e.transit = e.transit + (oe.count or 0)
+          end
+        end
+      end
+    end
+  end
+
+  for _, e in pairs(entries) do
+    total = total + e.count
+    breakdown[#breakdown + 1] = e
+  end
   table.sort(breakdown, function(a, b) return a.count > b.count end)
   return total, breakdown
+end
+
+-- Sum copper across every character on the same faction and connected-realm
+-- group. Wallet + gold sitting unclaimed in their inbox + gold in transit on
+-- outgoing mail (attributed to the recipient, mirroring item GetTotals).
+function addon:GetTotalMoney()
+  local total, breakdown = 0, {}
+  if not HelloStockDB or not HelloStockDB.characters then return 0, breakdown end
+
+  local myFaction = UnitFactionGroup("player") or "Neutral"
+  local realmSet  = ConnectedRealmSet()
+  local myID      = self:GetAccountID()
+
+  local function InScope(c)
+    return c.faction == myFaction
+       and c.realm
+       and realmSet[addon:NormalizeRealm(c.realm)]
+  end
+
+  local entries = {}
+  local function EntryFor(c)
+    local key = CharKey(c.realm, c.faction, c.name)
+    local e = entries[key]
+    if not e then
+      e = {
+        name    = (c.name or "?") .. "-" .. (c.realm or "?"),
+        copper  = 0,
+        mail    = 0,
+        transit = 0,
+        isMine  = c.accountID == myID,
+      }
+      entries[key] = e
+    end
+    return e
+  end
+
+  for _, c in pairs(HelloStockDB.characters) do
+    if InScope(c) and not self:IsIgnored(c.name, c.realm) then
+      local wallet = tonumber(c.money)     or 0
+      local mail   = tonumber(c.mailMoney) or 0
+      if wallet + mail > 0 then
+        local e = EntryFor(c)
+        e.copper = e.copper + wallet + mail
+        e.mail   = e.mail + mail
+      end
+    end
+  end
+
+  for _, sender in pairs(HelloStockDB.characters) do
+    if sender.moneyOutbox and not self:IsIgnored(sender.name, sender.realm) then
+      sender.moneyOutbox = ExpireOutbox(sender.moneyOutbox, sender.faction)
+      for _, oe in ipairs(sender.moneyOutbox) do
+        local recipient = FindCharByName(oe.to, sender.faction)
+        local attribTo  = (recipient and InScope(recipient)) and recipient or sender
+        if InScope(attribTo) and not self:IsIgnored(attribTo.name, attribTo.realm) then
+          local e = EntryFor(attribTo)
+          e.copper  = e.copper  + (oe.copper or 0)
+          e.transit = e.transit + (oe.copper or 0)
+        end
+      end
+    end
+  end
+
+  for _, e in pairs(entries) do
+    total = total + e.copper
+    breakdown[#breakdown + 1] = e
+  end
+  table.sort(breakdown, function(a, b) return a.copper > b.copper end)
+  return total, breakdown
+end
+
+-- One row per stored character, with the stats the Characters tab needs.
+-- Returns two lists: `inScope` (same faction + connected realm cluster as the
+-- viewing player) and `outOfScope` (everything else, surfaced in a collapsed
+-- footer for transparency). Each entry is a value-only table so the UI never
+-- mutates the underlying DB record.
+function addon:GetCharOverview()
+  local inScope, outOfScope = {}, {}
+  if not HelloStockDB or not HelloStockDB.characters then return inScope, outOfScope end
+
+  local myFaction = UnitFactionGroup("player") or "Neutral"
+  local realmSet  = ConnectedRealmSet()
+  local myID      = self:GetAccountID()
+
+  for _, c in pairs(HelloStockDB.characters) do
+    if c.name and c.name ~= "" and not self:IsIgnored(c.name, c.realm) then
+      local items = 0
+      if c.bags   then for _, n in pairs(c.bags)   do items = items + n end end
+      if c.bank   then for _, n in pairs(c.bank)   do items = items + n end end
+      if c.mail   then for _, n in pairs(c.mail)   do items = items + n end end
+      if c.outbox then for _, e in ipairs(c.outbox) do items = items + (e.count or 0) end end
+
+      local transitGold = 0
+      if c.moneyOutbox then
+        for _, e in ipairs(c.moneyOutbox) do transitGold = transitGold + (e.copper or 0) end
+      end
+
+      local inboxItemCount = 0
+      if c.mail then for _, n in pairs(c.mail) do inboxItemCount = inboxItemCount + n end end
+
+      local lastSync = math.max(
+        tonumber(c.bagsUpdated)   or 0,
+        tonumber(c.bankUpdated)   or 0,
+        tonumber(c.mailUpdated)   or 0,
+        tonumber(c.outboxUpdated) or 0
+      )
+      local isMine    = c.accountID == myID
+      local isPending = lastSync == 0
+      local row = {
+        key        = (c.realm or "") .. ":" .. (c.faction or "") .. ":" .. c.name,
+        name       = c.name,
+        realm      = c.realm or "?",
+        faction    = c.faction or "?",
+        class      = c.class,
+        level      = c.level,
+        accountID  = c.accountID,
+        isMine     = isMine,
+        isPending  = isPending,
+        kind       = isPending and "pending" or (isMine and "self" or "paired"),
+        lastSync   = lastSync,
+        items      = items,
+        copper     = (tonumber(c.money) or 0)
+                  + (tonumber(c.mailMoney) or 0)
+                  + transitGold,
+        wallet     = tonumber(c.money) or 0,
+        mailMoney  = tonumber(c.mailMoney) or 0,
+        transit    = transitGold,
+        inboxItems = inboxItemCount,
+        outboxItems = c.outbox and #c.outbox or 0,
+        pendingMail = inboxItemCount,  -- inbox items; in-transit added in pass 2
+        crafts      = c.crafts,
+        professions = c.professions,
+      }
+      local realmOK = c.realm and realmSet[addon:NormalizeRealm(c.realm)]
+      if c.faction == myFaction and realmOK then
+        inScope[#inScope + 1] = row
+      else
+        outOfScope[#outOfScope + 1] = row
+      end
+    end
+  end
+
+  -- Second pass: items in transit to each character (someone else's outbox
+  -- entries naming this char as recipient). Together with the inbox count
+  -- from pass 1 these form pendingMail — "things sent that the character
+  -- hasn't taken into their bags yet."
+  local byName = {}
+  for _, row in ipairs(inScope)    do byName[row.name] = row end
+  for _, row in ipairs(outOfScope) do byName[row.name] = row end
+  for _, sender in pairs(HelloStockDB.characters) do
+    if sender.outbox and not self:IsIgnored(sender.name, sender.realm) then
+      for _, e in ipairs(sender.outbox) do
+        if e.to and e.count then
+          local bare = e.to:match("^([^%-]+)") or e.to
+          local target = byName[bare]
+          if target then
+            target.pendingMail = (target.pendingMail or 0) + e.count
+          end
+        end
+      end
+    end
+  end
+
+  local function cmp(a, b)
+    -- Pending placeholders sink to the bottom. Then: level desc, class asc,
+    -- name asc as a stable tiebreaker.
+    if a.isPending ~= b.isPending then return not a.isPending end
+    local al, bl = a.level or 0, b.level or 0
+    if al ~= bl then return al > bl end
+    local ac, bc = a.class or "", b.class or ""
+    if ac ~= bc then return ac < bc end
+    return a.name < b.name
+  end
+  table.sort(inScope, cmp)
+  table.sort(outOfScope, cmp)
+  return inScope, outOfScope
 end
 
 local function PrimeItemCache()
@@ -551,14 +1337,23 @@ f:RegisterEvent("BAG_UPDATE_DELAYED")
 f:RegisterEvent("BANKFRAME_OPENED")
 f:RegisterEvent("BANKFRAME_CLOSED")
 f:RegisterEvent("PLAYERBANKSLOTS_CHANGED")
+f:RegisterEvent("PLAYER_MONEY")
+f:RegisterEvent("MAIL_SHOW")
+f:RegisterEvent("MAIL_INBOX_UPDATE")
+f:RegisterEvent("MAIL_SEND_SUCCESS")
+f:RegisterEvent("MAIL_CLOSED")
 f:RegisterEvent("GET_ITEM_INFO_RECEIVED")
 f:RegisterEvent("TRADE_SKILL_SHOW")
 f:RegisterEvent("TRADE_SKILL_UPDATE")
 f:RegisterEvent("CRAFT_SHOW")
 f:RegisterEvent("CRAFT_UPDATE")
+f:RegisterEvent("SPELLS_CHANGED")
+f:RegisterEvent("CHAT_MSG_SKILL")
+f:RegisterEvent("PLAYER_LEVEL_UP")
 
 local bankOpen = false
 local pendingItemRefresh = false
+local pendingProfRescan = false
 
 f:SetScript("OnEvent", function(_, event)
   if event == "PLAYER_LOGIN" then
@@ -582,12 +1377,41 @@ f:SetScript("OnEvent", function(_, event)
               if not tracked[id] then c.bank[id] = nil end
             end
           end
+          if c.mail then
+            for id in pairs(c.mail) do
+              if not tracked[id] then c.mail[id] = nil end
+            end
+          end
+          if c.outbox then
+            local kept = {}
+            for _, e in ipairs(c.outbox) do
+              if tracked[e.id] then kept[#kept + 1] = e end
+            end
+            c.outbox = ExpireOutbox(kept, c.faction)
+          end
+          if c.moneyOutbox then
+            c.moneyOutbox = ExpireOutbox(c.moneyOutbox, c.faction)
+          end
         end
       end
     end
     EnsureDB()
     PrimeItemCache()
     UpdateBags()
+    UpdateProfessions()
+    -- The spellbook isn't always populated by PLAYER_LOGIN; gathering
+    -- professions in particular sometimes return nil from GetProfessions()
+    -- at this point. Retry a few seconds in. SPELLS_CHANGED also fires
+    -- when the book becomes ready, so this is a belt-and-braces.
+    C_Timer.After(3, UpdateProfessions)
+    -- Friends list is populated asynchronously after login; defer the
+    -- auto-friend sync so the de-dup check against current friends is
+    -- accurate.
+    C_Timer.After(5, function()
+      if HelloStockDB and HelloStockDB.autoFriendPeers and addon.SyncPeerFriends then
+        addon:SyncPeerFriends()
+      end
+    end)
   elseif event == "BAG_UPDATE_DELAYED" then
     UpdateBags()
     if bankOpen then UpdateBank() end
@@ -598,7 +1422,46 @@ f:SetScript("OnEvent", function(_, event)
     if bankOpen then UpdateBank() end
   elseif event == "BANKFRAME_CLOSED" then
     bankOpen = false
+  elseif event == "PLAYER_MONEY" then
+    UpdateMoney()
+  elseif event == "MAIL_SHOW" then
+    InstallMailHooks()
+    if CheckInbox then CheckInbox() end
+    -- The inbox isn't ready immediately on MAIL_SHOW; MAIL_INBOX_UPDATE will
+    -- fire when contents are populated. Defer a scan as a safety net in case
+    -- the player opens an already-populated mailbox.
+    C_Timer.After(0.2, UpdateMail)
+  elseif event == "MAIL_INBOX_UPDATE" then
+    UpdateMail()
+  elseif event == "MAIL_SEND_SUCCESS" then
+    if pendingSend then
+      local c = EnsureDB()
+      c.outbox      = ExpireOutbox(c.outbox or {}, c.faction)
+      c.moneyOutbox = ExpireOutbox(c.moneyOutbox or {}, c.faction)
+      local now = time()
+      for _, m in ipairs(pendingSend.items) do
+        c.outbox[#c.outbox + 1] = { id = m.id, count = m.count, to = pendingSend.to, sentAt = now }
+      end
+      if pendingSend.money and pendingSend.money > 0 then
+        c.moneyOutbox[#c.moneyOutbox + 1] = {
+          copper = pendingSend.money, to = pendingSend.to, sentAt = now,
+        }
+      end
+      c.outboxUpdated = now
+      pendingSend = nil
+      RefreshUI()
+      Broadcast()
+    end
+  elseif event == "MAIL_CLOSED" then
+    -- Re-scan once on close: server may have processed take-attachment /
+    -- return-message actions whose final state only stabilises here.
+    UpdateMail()
   elseif event == "GET_ITEM_INFO_RECEIVED" then
+    -- An item's localized name just became available. Drop the cached
+    -- name→ID map so the next profession scan rebuilds it with the proper
+    -- localized name for whatever item this was (non-English clients depend
+    -- on this for recipe-name → item matching).
+    nameToID = nil
     if not pendingItemRefresh then
       pendingItemRefresh = true
       C_Timer.After(0.5, function() pendingItemRefresh = false; RefreshUI() end)
@@ -607,6 +1470,28 @@ f:SetScript("OnEvent", function(_, event)
       or event == "CRAFT_SHOW"       or event == "CRAFT_UPDATE" then
     -- A small delay gives the client time to populate the recipe list.
     C_Timer.After(0.1, ScanRecipes)
+    -- Refresh skill level too — opening a profession window is the most
+    -- common moment after a skill-up.
+    C_Timer.After(0.1, UpdateProfessions)
+  elseif event == "SPELLS_CHANGED" then
+    -- Fires when the spellbook is initialised after login and again any
+    -- time a spell is learned/unlearned (which includes professions).
+    UpdateProfessions()
+  elseif event == "CHAT_MSG_SKILL" then
+    -- Skill-up messages — caught here so Mining/Herbalism stay current
+    -- without needing to open a trade-skill window. Debounced because a
+    -- gathering session can spam these.
+    if not pendingProfRescan then
+      pendingProfRescan = true
+      C_Timer.After(3, function()
+        pendingProfRescan = false
+        UpdateProfessions()
+      end)
+    end
+  elseif event == "PLAYER_LEVEL_UP" then
+    EnsureDB()  -- re-reads UnitLevel into c.level
+    RefreshUI()
+    Broadcast()
   end
 end)
 
@@ -686,6 +1571,81 @@ function addon:RecordPeerPlaceholder(name, realm, faction, accountID)
   if addon.UI and addon.UI:IsShown() then addon.UI:Refresh() end
 end
 
+-- Friends-list integration. Opt-in via HelloStockDB.autoFriendPeers: when
+-- enabled, paired-account characters in the current scope are added to the
+-- friends list automatically. Adding them as friends is a known workaround
+-- for various Blizzard "interacting with a stranger" prompts (mail warnings,
+-- whispers in restricted modes, etc.). Removal is manual via /hs unbefriend.
+local function PeerCharsInScope()
+  local out = {}
+  if not HelloStockDB or not HelloStockDB.characters then return out end
+  local myFaction = UnitFactionGroup("player") or "Neutral"
+  local realmSet  = addon:ConnectedRealmSet()
+  local myID      = addon:GetAccountID()
+  for _, c in pairs(HelloStockDB.characters) do
+    if c.faction == myFaction
+       and c.realm and realmSet[addon:NormalizeRealm(c.realm)]
+       and c.accountID and c.accountID ~= myID
+       and c.name and c.name ~= "" then
+      out[#out + 1] = c
+    end
+  end
+  return out
+end
+
+local function CurrentFriendsSet()
+  local set = {}
+  if C_FriendList and C_FriendList.GetNumFriends then
+    for i = 1, C_FriendList.GetNumFriends() do
+      local info = C_FriendList.GetFriendInfoByIndex(i)
+      if info and info.name then set[info.name:lower()] = true end
+    end
+  end
+  return set
+end
+
+local function FullCharName(c)
+  return c.name .. "-" .. addon:NormalizeRealm(c.realm)
+end
+
+local AUTOFRIEND_NOTE = "Paired (HelloStock)"
+
+function addon:SyncPeerFriends()
+  if not C_FriendList or not C_FriendList.AddFriend then return 0 end
+  local friends = CurrentFriendsSet()
+  local added = 0
+  for _, c in ipairs(PeerCharsInScope()) do
+    local full = FullCharName(c)
+    if not friends[c.name:lower()] and not friends[full:lower()] then
+      -- C_FriendList.AddFriend accepts an optional `notes` parameter so
+      -- the addition is tagged in the friends panel without a separate
+      -- SetFriendNotes round-trip. Existing friends added manually keep
+      -- whatever note the user set themselves — we only stamp ours when
+      -- *we* add the entry.
+      C_FriendList.AddFriend(full, AUTOFRIEND_NOTE)
+      added = added + 1
+    end
+  end
+  return added
+end
+
+function addon:RemovePeerFriends()
+  if not C_FriendList or not C_FriendList.RemoveFriend then return 0 end
+  local friends = CurrentFriendsSet()
+  local removed = 0
+  for _, c in ipairs(PeerCharsInScope()) do
+    local full = FullCharName(c)
+    if friends[full:lower()] then
+      C_FriendList.RemoveFriend(full)
+      removed = removed + 1
+    elseif friends[c.name:lower()] then
+      C_FriendList.RemoveFriend(c.name)
+      removed = removed + 1
+    end
+  end
+  return removed
+end
+
 -- Whisper targets for solo sync: every character in the DB that belongs to a
 -- different account than ours (i.e. came in via a previous paired sync).
 function addon:GetWhisperTargets()
@@ -743,6 +1703,31 @@ function addon:Unpair()
         removed = removed + 1
       end
     end
+    -- Drop outbox entries on our remaining (own) chars that were addressed to
+    -- a peer character we just removed. Otherwise those entries would linger
+    -- as "in transit to <unknown char>" for up to 30 days, since the prune
+    -- rule keeps entries while their recipient hasn't proven receipt — and
+    -- with the recipient gone, that proof can never arrive.
+    for _, c in pairs(HelloStockDB.characters) do
+      if c.outbox then
+        local kept = {}
+        for _, e in ipairs(c.outbox) do
+          if FindCharByName(e.to, c.faction) then
+            kept[#kept + 1] = e
+          end
+        end
+        c.outbox = kept
+      end
+      if c.moneyOutbox then
+        local kept = {}
+        for _, e in ipairs(c.moneyOutbox) do
+          if FindCharByName(e.to, c.faction) then
+            kept[#kept + 1] = e
+          end
+        end
+        c.moneyOutbox = kept
+      end
+    end
   end
   if addon.UI and addon.UI:IsShown() then addon.UI:Refresh() end
   if self.RefreshOptions then self:RefreshOptions() end
@@ -790,16 +1775,16 @@ StaticPopupDialogs["HELLOSTOCK_UNPAIR"] = {
 }
 
 StaticPopupDialogs["HELLOSTOCK_CLEAR_TARGETS"] = {
-  text         = "HelloStock: clear every target stock level?\nThis only wipes the per-item targets; bag/bank snapshots and pairing are unaffected. The empty target list will sync to any paired account.",
+  text         = "HelloStock: clear every target stock level for this faction + realm cluster?\nThis only wipes the per-item targets for your current scope; bag/bank snapshots, pairing, and targets on the other faction or other clusters are unaffected. The empty target list will sync to any paired account on this scope.",
   button1      = "Clear",
   button2      = CANCEL,
   OnAccept     = function()
-    HelloStockDB = HelloStockDB or {}
-    HelloStockDB.targets = {}
-    HelloStockDB.targetsUpdatedAt = time()
+    local bucket = addon:GetTargets()
+    bucket.items     = {}
+    bucket.updatedAt = time()
     if addon.Comm and addon.Comm.SendTargets then addon.Comm:SendTargets() end
     if addon.UI and addon.UI:IsShown() then addon.UI:Refresh() end
-    print("|cffffd700HelloStock:|r all targets cleared.")
+    print("|cffffd700HelloStock:|r targets cleared for this scope.")
   end,
   timeout      = 30,
   whileDead    = true,
@@ -814,6 +1799,45 @@ StaticPopupDialogs["HELLOSTOCK_RESET"] = {
   OnAccept     = function()
     HelloStockDB = nil
     ReloadUI()
+  end,
+  timeout      = 30,
+  whileDead    = true,
+  hideOnEscape = true,
+  preferredIndex = 3,
+}
+
+-- Wipe characters + targets that belong to the current (faction, cluster)
+-- scope only. Pairing, other scopes' data, UI state, and the minimap stay
+-- intact. Returns the number of characters removed.
+function addon:ResetScope()
+  if not HelloStockDB then return 0 end
+  local myFaction = UnitFactionGroup("player") or "Neutral"
+  local realmSet  = self:ConnectedRealmSet()
+  local removed = 0
+  if HelloStockDB.characters then
+    for k, c in pairs(HelloStockDB.characters) do
+      local realmOK = c.realm and realmSet[self:NormalizeRealm(c.realm)]
+      if c.faction == myFaction and realmOK then
+        HelloStockDB.characters[k] = nil
+        removed = removed + 1
+      end
+    end
+  end
+  if HelloStockDB.targetsByScope then
+    HelloStockDB.targetsByScope[self:ScopeKey()] = nil
+  end
+  if addon.UI and addon.UI:IsShown() then addon.UI:Refresh() end
+  if self.RefreshOptions then self:RefreshOptions() end
+  return removed
+end
+
+StaticPopupDialogs["HELLOSTOCK_RESET_SCOPE"] = {
+  text         = "HelloStock: erase data for this faction + realm cluster?\nRemoves every character snapshot and target on the current scope. Pairing, other scopes' data, UI state, and the minimap are untouched.",
+  button1      = "Reset scope",
+  button2      = CANCEL,
+  OnAccept     = function()
+    local n = addon:ResetScope()
+    print(("|cffffd700HelloStock:|r reset current scope (%d character(s) removed)."):format(n))
   end,
   timeout      = 30,
   whileDead    = true,
@@ -889,27 +1913,19 @@ SlashCmdList["HELLOSTOCK"] = function(msg)
     if #whisperTargets == 0 then
       print("|cffffd700HelloStock:|r no paired characters known — pair via /hs pair first.")
     elseif addon.Comm and addon.Comm.SendSnapshot then
-      local pushed, skipped = {}, {}
+      local pushed   = {}
       local myFaction = MyFaction()
       local myID      = addon:GetAccountID()
       local realmSet  = addon:ConnectedRealmSet()
       for _, c in pairs(HelloStockDB and HelloStockDB.characters or {}) do
-        if c.accountID == myID and c.name and c.name ~= "" and c.realm and c.realm ~= "" then
-          if c.faction ~= myFaction then
-            skipped[#skipped + 1] = ("%s-%s: %s != my %s"):format(c.name, c.realm, c.faction or "?", myFaction)
-          elseif not realmSet[addon:NormalizeRealm(c.realm)] then
-            skipped[#skipped + 1] = ("%s-%s: realm not in connected cluster"):format(c.name, c.realm)
-          else
-            pushed[#pushed + 1] = c.name .. "-" .. c.realm
-          end
+        if c.accountID == myID and c.name and c.name ~= "" and c.realm and c.realm ~= ""
+           and c.faction == myFaction
+           and realmSet[addon:NormalizeRealm(c.realm)] then
+          pushed[#pushed + 1] = c.name .. "-" .. c.realm
         end
       end
       addon.Comm:SendSnapshot(true)
       print(("|cffffd700HelloStock:|r pushing %d chars: %s"):format(#pushed, table.concat(pushed, ", ")))
-      if #skipped > 0 then
-        print(("|cffaa3333  skipped %d (own chars not eligible to broadcast in this session):|r"):format(#skipped))
-        for _, s in ipairs(skipped) do print("    " .. s) end
-      end
     end
 
   elseif cmd == "forget" then
@@ -926,6 +1942,30 @@ SlashCmdList["HELLOSTOCK"] = function(msg)
             print(("|cffffd700HelloStock:|r removed %s-%s"):format(c.name, c.realm or "?"))
           end
         end
+        -- Same orphan cleanup as Unpair: any outbox entry addressed to the
+        -- character we just removed would otherwise linger for 30 days.
+        if removed > 0 then
+          for _, c in pairs(HelloStockDB.characters) do
+            if c.outbox then
+              local kept = {}
+              for _, e in ipairs(c.outbox) do
+                if FindCharByName(e.to, c.faction) then
+                  kept[#kept + 1] = e
+                end
+              end
+              c.outbox = kept
+            end
+            if c.moneyOutbox then
+              local kept = {}
+              for _, e in ipairs(c.moneyOutbox) do
+                if FindCharByName(e.to, c.faction) then
+                  kept[#kept + 1] = e
+                end
+              end
+              c.moneyOutbox = kept
+            end
+          end
+        end
       end
       if removed == 0 then
         print("|cffffd700HelloStock:|r no character named '" .. rest .. "' in the DB.")
@@ -933,6 +1973,119 @@ SlashCmdList["HELLOSTOCK"] = function(msg)
         RefreshUI()
       end
     end
+
+  elseif cmd == "profs" then
+    -- Diagnostic dump for profession capture. Run when professions look
+    -- wrong in the Characters overview.
+    print("|cffffd700HelloStock profs:|r")
+    print(("  TRADESKILLS global: %s"):format(tostring(_G.TRADESKILLS)))
+    print("  Skill panel (GetSkillLineInfo):")
+    local n = (GetNumSkillLines and GetNumSkillLines()) or 0
+    for i = 1, n do
+      local name, isHeader, _, rank, _, _, maxRank = GetSkillLineInfo(i)
+      if name then
+        if isHeader then
+          print(("    [header] %s"):format(name))
+        else
+          print(("      %s: %d/%d"):format(name, rank or 0, maxRank or 0))
+        end
+      end
+    end
+    print("  Spell-name lookups:")
+    for _, spellID in ipairs(PROFESSION_APPRENTICE_SPELL_IDS) do
+      local sname = GetSpellInfo and GetSpellInfo(spellID) or "?"
+      print(("    %d → %s"):format(spellID, tostring(sname)))
+    end
+    UpdateProfessions()
+    local me = addon:GetSelf()
+    if me and me.professions and #me.professions > 0 then
+      print("  Stored c.professions:")
+      for _, p in ipairs(me.professions) do
+        print(("    %s: %d/%d"):format(p.name, p.skill or 0, p.max or 0))
+      end
+    else
+      print("  c.professions: empty / not set")
+    end
+
+  elseif cmd == "ignore" or cmd == "unignore" then
+    if rest == "" then
+      print(("|cffffd700HelloStock:|r usage: /hs %s <CharName[-Realm]>"):format(cmd))
+    else
+      -- Accept "Name-Realm" verbatim; default to the current realm if only
+      -- a bare name was given. Stored key is lowercased and whitespace-
+      -- stripped so it round-trips consistently.
+      local name, realm = rest:match("^([^%-]+)%-(.+)$")
+      if not name then name, realm = rest, GetRealmName() or "" end
+      local key = IgnoreKey(name, realm)
+      HelloStockDB = HelloStockDB or {}
+      HelloStockDB.ignored = HelloStockDB.ignored or {}
+      local entry = NormalizeIgnoreEntry(HelloStockDB.ignored[key], HelloStockDB.ignoredUpdatedAt)
+      if cmd == "ignore" then
+        entry.addedAt = time()
+        HelloStockDB.ignored[key] = entry
+        -- Wipe any stored data for this character — ignoring should leave
+        -- no trace. Future snapshots from this character get dropped in
+        -- ReceiveSnapshot, so the record stays gone until un-ignored.
+        local removed = 0
+        if HelloStockDB.characters then
+          for k, c in pairs(HelloStockDB.characters) do
+            if addon:IsIgnored(c.name, c.realm) then
+              HelloStockDB.characters[k] = nil
+              removed = removed + 1
+            end
+          end
+        end
+        print(("|cffffd700HelloStock:|r ignoring %s-%s (%d record(s) removed). Future snapshots from them will be dropped."):format(name, realm, removed))
+      else
+        entry.removedAt = time()
+        HelloStockDB.ignored[key] = entry
+        print(("|cffffd700HelloStock:|r no longer ignoring %s-%s. Their data will reappear after their next snapshot."):format(name, realm))
+      end
+      if addon.Comm and addon.Comm.SendIgnoreList then addon.Comm:SendIgnoreList() end
+      if addon.UI and addon.UI:IsShown() then addon.UI:Refresh() end
+    end
+
+  elseif cmd == "ignored" then
+    local any = false
+    if HelloStockDB and HelloStockDB.ignored then
+      for key, e in pairs(HelloStockDB.ignored) do
+        local entry = NormalizeIgnoreEntry(e, HelloStockDB.ignoredUpdatedAt)
+        if (entry.addedAt or 0) > (entry.removedAt or 0) then
+          if not any then
+            print("|cffffd700HelloStock:|r ignored characters:")
+            any = true
+          end
+          print("  " .. key)
+        end
+      end
+    end
+    if not any then
+      print("|cffffd700HelloStock:|r no characters are ignored. /hs ignore <CharName[-Realm]> to add one.")
+    end
+
+  elseif cmd == "autofriend" then
+    HelloStockDB = HelloStockDB or {}
+    local arg = rest:lower()
+    if arg == "on" then
+      HelloStockDB.autoFriendPeers = true
+    elseif arg == "off" then
+      HelloStockDB.autoFriendPeers = false
+    else
+      HelloStockDB.autoFriendPeers = not HelloStockDB.autoFriendPeers
+    end
+    print(("|cffffd700HelloStock:|r auto-add paired-account characters to friends list: %s")
+      :format(HelloStockDB.autoFriendPeers and "ON" or "OFF"))
+    if HelloStockDB.autoFriendPeers then
+      local n = addon:SyncPeerFriends()
+      if n > 0 then
+        print(("|cffffd700HelloStock:|r added %d paired character(s) to your friends list."):format(n))
+      end
+    end
+    if addon.RefreshOptions then addon:RefreshOptions() end
+
+  elseif cmd == "unbefriend" then
+    local n = addon:RemovePeerFriends()
+    print(("|cffffd700HelloStock:|r removed %d paired character(s) from your friends list."):format(n))
 
   elseif cmd == "debug" then
     HelloStockDB = HelloStockDB or {}
@@ -952,6 +2105,9 @@ SlashCmdList["HELLOSTOCK"] = function(msg)
 
   elseif cmd == "reset" then
     StaticPopup_Show("HELLOSTOCK_RESET")
+
+  elseif cmd == "resetscope" then
+    StaticPopup_Show("HELLOSTOCK_RESET_SCOPE")
 
   elseif cmd == "resetpos" then
     if addon.UI and addon.UI.ResetPosition then
@@ -1087,6 +2243,6 @@ SlashCmdList["HELLOSTOCK"] = function(msg)
     end
 
   else
-    print("|cffffd700HelloStock:|r commands: /hs, /hs pair [name], /hs secret [word], /hs unpair, /hs sync, /hs status, /hs whoami, /hs chars, /hs claim <name>, /hs claimall, /hs forget <name>, /hs debug, /hs config, /hs ping, /hs resetpos, /hs minimap, /hs gather, /hs cleartargets, /hs reset")
+    print("|cffffd700HelloStock:|r commands: /hs, /hs pair [name], /hs secret [word], /hs unpair, /hs sync, /hs status, /hs whoami, /hs chars, /hs claim <name>, /hs claimall, /hs forget <name>, /hs ignore <name>, /hs unignore <name>, /hs ignored, /hs autofriend [on|off], /hs unbefriend, /hs debug, /hs config, /hs ping, /hs resetpos, /hs minimap, /hs gather, /hs cleartargets, /hs resetscope, /hs reset")
   end
 end

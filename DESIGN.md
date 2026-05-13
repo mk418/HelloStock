@@ -404,6 +404,16 @@ Adjust the WoW path for your install. If the addon shows "Out of Date," check `/
 - [x] Curated Consumables tab: Utility, Flasks, Battle Elixirs, Guardian Elixirs, Combat Potions, Protection Potions, Food & Drink, Jujus, Weapon Buffs, Bandages
 - [x] Greatest-tier-first ordering throughout, with paired Heavy/Greater + regular variants
 
+### Mail & money
+- [x] Inbox scan via `MAIL_SHOW` / `MAIL_INBOX_UPDATE` / `MAIL_CLOSED`: items into `c.mail`, attached gold (not-yet-taken) into `c.mailMoney`
+- [x] Outgoing-mail capture via `PreClick` on `SendMailMailButton` + `MAIL_SEND_SUCCESS`: items into `c.outbox`, gold into `c.moneyOutbox`. Scoped to recipients matching a stored character (`IsKnownChar`); sends to non-tracked names leave the pool normally
+- [x] Recipient-aware prune: in-transit entries kept until `recipient.mailUpdated >= sentAt + 60min` (proof of receipt), 30-day hard cap matching WoW's auto-return-to-sender window
+- [x] Recipient attribution: tooltip / breakdown rows show in-transit on the receiving character, not the sender
+- [x] Wallet tracker (`c.money`) updated on `PLAYER_MONEY`; `GetTotalMoney` aggregates wallet + inbox + transit
+- [x] Sync extends the snapshot payload with `mail=`/`mts=`/`mmny=` and `out=`/`mout=`/`ots=`; missing fields preserve existing buckets so older peers don't blow away your data
+- [x] `Unpair` and `/hs forget` drop orphaned outbox entries pointing to removed characters
+- [x] Footer line in the main window with formatted gold total + per-character breakdown tooltip (in-mail / in-transit annotations)
+
 ### Packaging
 - [x] `.toc` with `## SavedVariables: HelloStockDB` and `## X-Curse-Project-ID`
 - [x] BigWigs packager `.pkgmeta` for CurseForge release
@@ -411,13 +421,22 @@ Adjust the WoW path for your install. If the addon shows "Out of Date," check `/
 
 ---
 
+## Deliberately out of scope
+
+### Auction-house listings
+
+Items you list on the AH are intentionally treated as gone from the stockpile. The mental model is **intent**: listing is a declaration of "I don't want this anymore, get me gold instead." The bag count dropping is the correct signal — folding listings back into the totals would make the addon nag you to re-stock items you've explicitly decided to sell.
+
+This is also why mail between own characters *is* tracked: mailing to an alt is moving the stockpile around, not exiting it. The transience is similar but the intent is opposite.
+
+A reasonable counter-argument is "what about raw ingredients listed speculatively that I'd cancel and use if a craft demands them?" — but that workflow is rare, and the clean exit-on-list signal serves the common case (selling surplus past your target levels) much better than a per-tab toggle would. If you want listed items back in your pool, cancel the auction.
+
+---
+
 ## TODO
 
 ### Items
 - [ ] Verify all item IDs against current Classic Era item DB (several IDs in this design were typed from memory and corrected after `/reload` testing — there may be a few that haven't been hit yet)
-
-### Stockpile accuracy
-- [ ] Include items sitting in the mailbox and on the auction house in stock totals. Today only bags + bank are scanned, so items in transit between paired characters or listed for sale temporarily disappear from the total. Hook `MAIL_INBOX_UPDATE` for the inbox and `AUCTION_OWNED_LIST_UPDATE` for owned listings, and add them as separate buckets in the per-character breakdown so the tooltip can show them distinctly ("in mail", "on AH") instead of folding them into the bag count.
 
 ### Reliability
 - [ ] First-load schema migration logic if anything in `HelloStockDB` ever needs renaming (currently stale keys are harmless but accumulate)

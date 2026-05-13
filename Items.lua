@@ -45,24 +45,57 @@ addon.ITEMS = {
       { id = 2447,  name = "Peacebloom" },
     }},
     { category = "Ores & Bars", items = {
-      { id = 12360, name = "Arcanite Bar" },
-      { id = 12655, name = "Enchanted Thorium Bar" },
-      { id = 11371, name = "Dark Iron Bar" },
+      { id = 12360, name = "Arcanite Bar", recipe = {
+        -- Alchemy transmute (4-day cooldown). One cast yields one bar.
+        { id = 12363, count = 1 },  -- Arcane Crystal
+        { id = 12359, count = 1 },  -- Thorium Bar
+      } },
+      { id = 12363, name = "Arcane Crystal" },
+      { id = 12655, name = "Enchanted Thorium Bar", recipe = {
+        -- Enchanting recipe (Recipe: Enchanted Thorium Bar, Felwood vendor).
+        { id = 12359, count = 1 },  -- Thorium Bar
+        { id = 16202, count = 1 },  -- Lesser Eternal Essence
+      } },
+      { id = 11371, name = "Dark Iron Bar", recipe = {
+        -- Smelt Dark Iron requires the Dark Iron Forge in BRD; one bar
+        -- costs 8 ore (only smelt recipe in classic where the ratio
+        -- isn't 1:1).
+        { id = 11370, count = 8 },  -- Dark Iron Ore
+      } },
       { id = 11370, name = "Dark Iron Ore" },
-      { id = 12359, name = "Thorium Bar" },
+      { id = 12359, name = "Thorium Bar", recipe = {
+        { id = 10620, count = 1 },  -- Thorium Ore
+      } },
       { id = 10620, name = "Thorium Ore" },
-      { id = 6037,  name = "Truesilver Bar" },
+      { id = 6037,  name = "Truesilver Bar", recipe = {
+        { id = 7911,  count = 1 },  -- Truesilver Ore
+      } },
       { id = 7911,  name = "Truesilver Ore" },
-      { id = 3860,  name = "Mithril Bar" },
+      { id = 3860,  name = "Mithril Bar", recipe = {
+        { id = 3858,  count = 1 },  -- Mithril Ore
+      } },
       { id = 3858,  name = "Mithril Ore" },
-      { id = 3577,  name = "Gold Bar" },
+      { id = 3577,  name = "Gold Bar", recipe = {
+        { id = 2776,  count = 1 },  -- Gold Ore
+      } },
       { id = 2776,  name = "Gold Ore" },
-      { id = 3575,  name = "Iron Bar" },
+      { id = 3575,  name = "Iron Bar", recipe = {
+        { id = 2772,  count = 1 },  -- Iron Ore
+      } },
       { id = 2772,  name = "Iron Ore" },
-      { id = 2841,  name = "Bronze Bar" },
-      { id = 3576,  name = "Tin Bar" },
+      { id = 2841,  name = "Bronze Bar", recipe = {
+        -- Bronze is the only smelt that consumes bars (not ore): one
+        -- copper + one tin produces one bronze.
+        { id = 2840,  count = 1 },  -- Copper Bar
+        { id = 3576,  count = 1 },  -- Tin Bar
+      } },
+      { id = 3576,  name = "Tin Bar", recipe = {
+        { id = 2771,  count = 1 },  -- Tin Ore
+      } },
       { id = 2771,  name = "Tin Ore" },
-      { id = 2840,  name = "Copper Bar" },
+      { id = 2840,  name = "Copper Bar", recipe = {
+        { id = 2770,  count = 1 },  -- Copper Ore
+      } },
       { id = 2770,  name = "Copper Ore" },
     }},
     { category = "Stones", items = {

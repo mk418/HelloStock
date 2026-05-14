@@ -873,6 +873,11 @@ addon.ITEMS = {
         { kind = "mob", zone = "Western Plaguelands", levels = "51-58", spawn_count = 7, avg_chance = 4.2, respawn = 364, per_hour = 3.0,
           mobs = { { name = "Araj the Summoner", chance = 4.7 }, { name = "Skeletal Warlord", chance = 4.1 } } },
       }},
+      { id = 12811, name = "Righteous Orb", sources = {
+        { kind = "dungeon", zone = "Stratholme", levels = "55-60", spawn_count = 200, avg_chance = 1.5, respawn = 15091,
+          mobs = { { name = "Scarlet Crusader", chance = 1.5 }, { name = "Crimson Initiate", chance = 1.5 }, { name = "Scarlet Praetorian", chance = 1.5 } } },
+        { kind = "vendor", zone = "Lokhtos Darkbargainer (Blackrock Depths, Thorium Brotherhood)" },
+      }},
       { id = 7067,  name = "Elemental Earth", sources = {
         { kind = "dungeon", zone = "Molten Core", levels = "60", spawn_count = 54, avg_chance = 1.3, respawn = 20640, per_hour = 0.5,
           mobs = { { name = "Molten Giant", chance = 1.9 }, { name = "Lava Surger", chance = 1.6 }, { name = "Lava Annihilator", chance = 1.2 } } },

@@ -198,6 +198,9 @@ local craftableOnly = false
 -- Switches the "To gather" tab between the default per-item list and a
 -- zones-to-farm aggregate view (see RenderFarmTab + ComputeFarmList).
 local gatherByZone = false
+-- Switches the "To craft" tab between the default per-item list and a
+-- per-character grouping (see RenderCraftByCharacterTab).
+local craftByCharacter = false
 local classFilter = nil  -- currently active filter (nil = "All classes", otherwise class name)
 local pickedClass = nil  -- last explicit dropdown choice (for the text-click toggle)
 local classFilterSource = "picked"  -- "picked" (dropdown / default) or "toggled" (text-clicked to player class)
@@ -236,11 +239,12 @@ end
 local function SaveFilters()
   -- Generic filters are shared across all characters on the account.
   UIStore().filters = {
-    inStock      = inStockOnly,
-    withTarget   = targetsOnly,
-    underTarget  = underTargetOnly,
-    craftable    = craftableOnly,
-    gatherByZone = gatherByZone,
+    inStock          = inStockOnly,
+    withTarget       = targetsOnly,
+    underTarget      = underTargetOnly,
+    craftable        = craftableOnly,
+    gatherByZone     = gatherByZone,
+    craftByCharacter = craftByCharacter,
   }
   -- Class filter is per-character: each toon picks the class context that
   -- matches whoever is logged in, not whatever an alt last set.
@@ -256,11 +260,12 @@ end
 local function LoadFilters()
   local f = UIStore().filters
   if f then
-    inStockOnly     = f.inStock     and true or false
-    targetsOnly     = f.withTarget  and true or false
-    underTargetOnly = f.underTarget and true or false
-    craftableOnly   = f.craftable   and true or false
-    gatherByZone    = f.gatherByZone and true or false
+    inStockOnly      = f.inStock     and true or false
+    targetsOnly      = f.withTarget  and true or false
+    underTargetOnly  = f.underTarget and true or false
+    craftableOnly    = f.craftable   and true or false
+    gatherByZone     = f.gatherByZone     and true or false
+    craftByCharacter = f.craftByCharacter and true or false
   end
   local cs = CharStore()
   classFilter       = cs.class
@@ -359,8 +364,6 @@ local craftableCheck = MakeFilterCheck("HelloStockCraftableCheck", "Craftable", 
   SaveFilters()
   UI:Refresh()
 end)
-craftableCheck:ClearAllPoints()
-craftableCheck:SetPoint("LEFT", searchClear, "RIGHT", 4, 0)
 
 -- "By zone" toggle. Only shown on the "To gather" tab. When checked, the
 -- gather list renders as a ranked set of zones (where to farm efficiently
@@ -372,6 +375,21 @@ local byZoneCheck = MakeFilterCheck("HelloStockByZoneCheck", "By zone", craftabl
 end)
 byZoneCheck:ClearAllPoints()
 byZoneCheck:SetPoint("LEFT", searchClear, "RIGHT", 4, 0)
+
+-- "By character" toggle. Only shown on the "To craft" tab. When checked,
+-- the craft list groups items by which character can make them — useful
+-- when crafts are spread across alts.
+local byCharCheck = MakeFilterCheck("HelloStockByCharCheck", "By character", byZoneCheck, function(self)
+  craftByCharacter = self:GetChecked() and true or false
+  SaveFilters()
+  UI:Refresh()
+end)
+-- On the "To craft" tab both "By character" and "Craftable" are visible;
+-- order them left-to-right as searchClear → By character → Craftable.
+byCharCheck:ClearAllPoints()
+byCharCheck:SetPoint("LEFT", searchClear, "RIGHT", 4, 0)
+craftableCheck:ClearAllPoints()
+craftableCheck:SetPoint("LEFT", _G["HelloStockByCharCheckText"] or byCharCheck, "RIGHT", 6, 0)
 
 -- Class filter dropdown. Filters items that carry a `classes` field (mostly
 -- consumables); items without the field show regardless of selection.
@@ -1053,8 +1071,50 @@ local function MakeHeader(i)
       UI:Refresh()
     end
   end)
-  h:SetScript("OnEnter", function(self) self.text:SetTextColor(1, 1, 1) end)
-  h:SetScript("OnLeave", function(self) self.text:SetTextColor(1, 0.82, 0) end)
+  -- On hover: always brighten the label; additionally, if this header is
+  -- showing the byzone column labels, show a GameTooltip explaining what
+  -- each column means and the per-hour ceilings the rate column assumes.
+  -- On leave: restore the natural color — for byzone headers we may have
+  -- stashed a level-appropriate color in self._textColor (set per-render
+  -- in RenderFarmTab); fall back to the default gold otherwise.
+  h:SetScript("OnEnter", function(self)
+    self.text:SetTextColor(1, 1, 1)
+    if self.bzNeedLabel and self.bzNeedLabel:IsShown() then
+      GameTooltip:SetOwner(self, "ANCHOR_TOPRIGHT")
+      -- Force a wider tooltip so the column explanations breathe instead
+      -- of wrapping mid-sentence at the default ~200px width.
+      GameTooltip:SetMinimumWidth(440)
+      GameTooltip:AddLine("Columns", 1, 0.82, 0)
+      GameTooltip:AddLine(" ")
+      GameTooltip:AddDoubleLine("Need",
+        "items remaining in your gather list", 0.85, 0.75, 0.5, 1, 1, 1)
+      GameTooltip:AddDoubleLine("Drop %",
+        "chance per mob kill", 0.85, 0.75, 0.5, 1, 1, 1)
+      GameTooltip:AddDoubleLine("Per node",
+        "items per herb / mine / skin gather", 0.85, 0.75, 0.5, 1, 1, 1)
+      GameTooltip:AddDoubleLine("Per hr",
+        "Estimated farming rate", 0.85, 0.75, 0.5, 1, 1, 1)
+      GameTooltip:AddLine(
+        "  capped at 60 kills/hr (mobs), 30 gathers/hr (nodes),",
+        0.7, 0.7, 0.7, true)
+      GameTooltip:AddLine(
+        "  or 2 dungeon clears/hr — reflects travel + kill + pickup time",
+        0.7, 0.7, 0.7, true)
+      GameTooltip:AddDoubleLine("Hours",
+        "ETA to clear this item's deficit at the per hour rate",
+        0.85, 0.75, 0.5, 1, 1, 1)
+      GameTooltip:Show()
+    end
+  end)
+  h:SetScript("OnLeave", function(self)
+    local c = self._textColor
+    if c then
+      self.text:SetTextColor(c[1], c[2], c[3])
+    else
+      self.text:SetTextColor(1, 0.82, 0)
+    end
+    GameTooltip:Hide()
+  end)
   headerPool[i] = h
   return h
 end
@@ -1258,6 +1318,29 @@ local function BindCharRow(row, entry)
   end)
 end
 
+-- Pick a header text color for a zone based on the player's level vs the
+-- zone's level range. Green for trivial (player significantly above the
+-- zone), default gold for level-appropriate, orange for stretching above
+-- your level, red for outright dangerous. "city" / unknown / unparseable
+-- level strings fall through to default gold.
+local function ZoneColor(levels)
+  if not levels or levels == "city" or levels == "?-?" then
+    return 1, 0.82, 0
+  end
+  local lo, hi = levels:match("(%d+)%s*-%s*(%d+)")
+  if not lo then
+    lo = levels:match("(%d+)")
+    hi = lo
+  end
+  if not lo then return 1, 0.82, 0 end
+  lo, hi = tonumber(lo), tonumber(hi)
+  local pl = UnitLevel("player") or 60
+  if     pl < lo - 5 then return 1.0, 0.30, 0.30   -- way too low
+  elseif pl < lo     then return 1.0, 0.55, 0.30   -- stretch
+  elseif pl > hi + 5 then return 0.50, 0.85, 0.50  -- trivial
+  else                    return 1.0, 0.82, 0.0   end-- appropriate
+end
+
 -- "By zone" view of the gather tab: walks the gather list via
 -- ComputeFarmList, suggests zones to visit ranked by total expected items.
 -- Uses the same MakeHeader / MakeRow pool as the regular tabs so zones look
@@ -1329,6 +1412,13 @@ local function RenderFarmTab()
     local h = MakeHeader(hIdx)
     h.category = zone.zone
     h.text:SetText(zone.zone .. (zone.levels and ("  (" .. zone.levels .. ")") or ""))
+    -- Tint the zone header by the player's level vs the zone's level range.
+    -- _textColor is read by MakeHeader's OnLeave so the natural color is
+    -- restored after a hover; reset to nil in the cleanup loop so headers
+    -- reused on other tabs revert to the default gold.
+    local cr, cg, cb = ZoneColor(zone.levels)
+    h.text:SetTextColor(cr, cg, cb)
+    h._textColor = { cr, cg, cb }
     local collapsed = IsCollapsed(currentTab, zone.zone)
     if collapsed then
       h.arrow:SetTexture("Interface\\Buttons\\UI-PlusButton-Up")
@@ -1448,6 +1538,159 @@ local function RenderFarmTab()
   content:SetHeight(math.max(y, scroll:GetHeight()))
 end
 
+-- "By character" view of the To-craft tab: walks the craft list, groups
+-- entries by which character can make them via addon:GetCrafters, and
+-- renders one collapsible header per character (mine first, then peers,
+-- then a final "No known crafter" bucket if anything in the craft list
+-- has no known maker). Items under each header use the same Need/Stock/
+-- Craft column layout as the regular To-craft view.
+local function RenderCraftByCharacterTab()
+  local list = addon:ComputeCraftListByCharacter()
+  local y, rIdx, hIdx, lblIdx = 0, 0, 0, 0
+  content.profLabels = content.profLabels or {}
+
+  if not list or #list == 0 then
+    if not content.emptyMessage then
+      local fs = content:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+      fs:SetJustifyH("CENTER"); fs:SetWordWrap(true)
+      content.emptyMessage = fs
+    end
+    content.emptyMessage:ClearAllPoints()
+    content.emptyMessage:SetPoint("CENTER", scroll, "CENTER", 0, 0)
+    content.emptyMessage:SetWidth(scroll:GetWidth() - 40)
+    local hasTargets = false
+    for _ in pairs(addon:GetTargets().items) do hasTargets = true; break end
+    if hasTargets then
+      content.emptyMessage:SetTextColor(0.4, 1, 0.4)
+      content.emptyMessage:SetText("Nothing to craft — your targeted items are stocked or gather-only.")
+    else
+      content.emptyMessage:SetTextColor(1, 0.82, 0)
+      content.emptyMessage:SetText("Set target stock levels first; this view groups the craft list by which character can make each item.")
+    end
+    content.emptyMessage:Show()
+    content:SetHeight(math.max(scroll:GetHeight(), 1))
+    return
+  end
+
+  for _, char in ipairs(list) do
+    hIdx = hIdx + 1
+    local h = MakeHeader(hIdx)
+    h.category = char.name
+    local collapsed = IsCollapsed(currentTab, char.name)
+    h.arrow:SetTexture(collapsed
+      and "Interface\\Buttons\\UI-PlusButton-Up"
+      or  "Interface\\Buttons\\UI-MinusButton-Up")
+    h.arrow:Show()
+    h.stockLabel:ClearAllPoints()
+    h.stockLabel:SetPoint("RIGHT", h, "RIGHT", -130, 0)
+    h.stockLabel:SetText("Need")
+    h.stockLabel:Show()
+    h.gatherMidLabel:Show()
+    h.targetLabel:ClearAllPoints()
+    h.targetLabel:SetPoint("RIGHT", h, "RIGHT", -16, 0)
+    h.targetLabel:SetText("Craft")
+    h.targetLabel:Show()
+    h.text:SetText(char.name)
+    -- Tint: own characters in gold, peer-account characters in grey, the
+    -- "No known crafter" bucket in red so it reads as a problem column.
+    if char.isUnknown then
+      h.text:SetTextColor(1, 0.5, 0.5)
+      h._textColor = { 1, 0.5, 0.5 }
+    elseif char.isMine then
+      h.text:SetTextColor(1, 0.82, 0)
+      h._textColor = { 1, 0.82, 0 }
+    else
+      h.text:SetTextColor(0.7, 0.7, 0.7)
+      h._textColor = { 0.7, 0.7, 0.7 }
+    end
+    h:ClearAllPoints()
+    h:SetPoint("TOPLEFT", 0, -y)
+    h:Show()
+    y = y + 22
+
+    if not collapsed then
+      -- Items are pre-sorted by profession → section → craft count. Emit a
+      -- small profession sub-label whenever the profession changes so the
+      -- groups read as labeled blocks instead of one undifferentiated list.
+      local lastProf
+      for _, entry in ipairs(char.items) do
+        local prof = addon:GetProfession(entry.id)
+        if prof ~= lastProf then
+          lblIdx = lblIdx + 1
+          local lbl = content.profLabels[lblIdx]
+          if not lbl then
+            lbl = content:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            lbl:SetJustifyH("LEFT")
+            content.profLabels[lblIdx] = lbl
+          end
+          lbl:SetText(prof)
+          lbl:SetTextColor(0.85, 0.75, 0.5)
+          lbl:ClearAllPoints()
+          -- Align with the item icon column so the label visually sits
+          -- directly above the icons of its group (icons start at LEFT 4).
+          lbl:SetPoint("TOPLEFT", 4, -y)
+          lbl:Show()
+          y = y + 16
+          lastProf = prof
+        end
+        rIdx = rIdx + 1
+        local row = MakeRow(rIdx)
+        local name, _, _, _, _, _, _, _, _, texture = GetItemInfo(entry.id)
+        row.itemID = entry.id
+        row.sep:Hide()
+        row.icon:Show()
+        row.icon:SetTexture(texture or "Interface\\Icons\\INV_Misc_QuestionMark")
+        row.icon:SetAlpha(1)
+        row.icon:ClearAllPoints()
+        row.icon:SetPoint("LEFT", 4, 0)
+        row.name:Show()
+        row.name:SetAlpha(1)
+        row.name:SetText(name or ("Item " .. entry.id))
+        row.name:SetTextColor(1, 1, 1)
+        row.count:Hide()
+        if row.targetBox then row.targetBox:Hide() end
+        row.gatherNeed:Show()
+        row.gatherNeed:SetText(tostring(entry.needed))
+        row.gatherNeed:SetTextColor(1, 0.82, 0)
+        row.gatherStock:Show()
+        row.gatherStock:SetText(tostring(entry.have))
+        row.gatherStock:SetTextColor(1, 1, 1)
+        row.gatherCount:Show()
+        row.gatherCount:SetText(tostring(entry.craft))
+        row.gatherCount:SetTextColor(1, 0.3, 0.3)
+        if row.needHover  then row.needHover.qty  = entry.needed; row.needHover:Show()  end
+        if row.stockHover then row.stockHover.qty = entry.have;   row.stockHover:Show() end
+        if row.craftHover then row.craftHover.qty = entry.craft;  row.craftHover:Show() end
+        row.boundLock:SetShown(addon:IsBoP(entry.id))
+        if entry.craftLevel == "full" then
+          row.craftableBg:SetColorTexture(0.2, 0.8, 0.2, 0.14)
+          row.craftableBg:Show()
+        elseif entry.craftLevel == "half" then
+          row.craftableBg:SetColorTexture(1.0, 0.82, 0.0, 0.12)
+          row.craftableBg:Show()
+        else
+          row.craftableBg:Hide()
+        end
+        row.recipeKnown:Hide()  -- redundant — every row here has a crafter
+        row.connectorV:Hide()
+        row.connectorH:Hide()
+        row:ClearAllPoints()
+        row:SetPoint("TOPLEFT", 0, -y)
+        row:Show()
+        y = y + 20
+      end
+      y = y + 8
+    end
+  end
+
+  -- Hide any profession labels left over from a longer previous render.
+  for i = lblIdx + 1, #content.profLabels do
+    content.profLabels[i]:Hide()
+  end
+
+  content:SetHeight(math.max(y, 1))
+end
+
 local function RenderCharactersTab()
   local inScope, outOfScope = addon:GetCharOverview()
   local y, rIdx, hIdx = 0, 0, 0
@@ -1534,10 +1777,17 @@ function UI:Refresh()
     if h.bzYieldLabel then h.bzYieldLabel:Hide() end
     if h.bzRateLabel  then h.bzRateLabel:Hide()  end
     if h.bzHoursLabel then h.bzHoursLabel:Hide() end
+    -- Clear any level-tint left over from the byzone view so headers reused
+    -- on regular tabs restore to the default gold via MakeHeader's OnLeave.
+    h._textColor = nil
+    h.text:SetTextColor(1, 0.82, 0)
   end
   if content.emptyMessage then content.emptyMessage:Hide() end
   if content.farmLines then
     for _, fs in ipairs(content.farmLines) do fs:Hide() end
+  end
+  if content.profLabels then
+    for _, fs in ipairs(content.profLabels) do fs:Hide() end
   end
 
   -- Filter checkboxes don't apply on the meta tabs (gather / craft / chars).
@@ -1552,6 +1802,8 @@ function UI:Refresh()
   craftableCheck:SetShown(currentTab == "To craft")
   byZoneCheck:SetShown(currentTab == "To gather")
   byZoneCheck:SetChecked(gatherByZone)
+  byCharCheck:SetShown(currentTab == "To craft")
+  byCharCheck:SetChecked(craftByCharacter)
   ApplyClassWidgetVisibility()
 
   if currentTab == "To gather" then
@@ -1682,6 +1934,7 @@ function UI:Refresh()
           row.sep:Hide()
           row.icon:Show()
           row.icon:SetTexture(texture or "Interface\\Icons\\INV_Misc_QuestionMark")
+          row.icon:SetAlpha(1)  -- pooled rows inherit ApplyVisual's dim
           row.icon:ClearAllPoints()
           row.icon:SetPoint("LEFT", 4, 0)
           row.name:Show()
@@ -1720,6 +1973,10 @@ function UI:Refresh()
   end
 
   if currentTab == "To craft" then
+    if craftByCharacter then
+      RenderCraftByCharacterTab()
+      return
+    end
     -- Mirrors the gather view but emits craftable items + a count of how many
     -- of each you'd need to make, including intermediates.
     local list = addon:ComputeCraftList()
@@ -1837,6 +2094,7 @@ function UI:Refresh()
           row.sep:Hide()
           row.icon:Show()
           row.icon:SetTexture(texture or "Interface\\Icons\\INV_Misc_QuestionMark")
+          row.icon:SetAlpha(1)  -- pooled rows inherit ApplyVisual's dim
           row.icon:ClearAllPoints()
           row.icon:SetPoint("LEFT", 4, 0)
           row.name:Show()

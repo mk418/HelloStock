@@ -202,6 +202,83 @@ function addon:GetItemCategory(itemID)
   return categoryMap[itemID]
 end
 
+-- itemID -> "Ingredients" or "Consumables" — the top-level section of
+-- addon.ITEMS the item lives in. Used by the By-character craft view to
+-- sort raw/intermediate components (Ingredients section) ahead of end
+-- consumables (Consumables section) within each profession.
+local sectionMap
+local function BuildSectionMap()
+  if sectionMap then return end
+  sectionMap = {}
+  if not addon.ITEMS then return end
+  for sectionName, section in pairs(addon.ITEMS) do
+    for _, group in ipairs(section) do
+      for _, item in ipairs(group.items) do
+        if item.id then sectionMap[item.id] = sectionName end
+      end
+    end
+  end
+end
+
+function addon:GetItemSection(itemID)
+  BuildSectionMap()
+  return sectionMap[itemID]
+end
+
+-- Profession lookup, used to bucket items in the By-character craft view.
+-- Most Items.lua categories map cleanly to a single profession; the
+-- "Weapon Buffs" and "Utility" categories are mixed and need per-item
+-- overrides. Items whose profession can't be resolved fall back to
+-- "Other" so they still group together rather than getting scattered.
+local CATEGORY_PROFESSION = {
+  Flasks               = "Alchemy",
+  ["Battle Elixirs"]   = "Alchemy",
+  ["Guardian Elixirs"] = "Alchemy",
+  ["Combat Potions"]   = "Alchemy",
+  ["Protection Potions"] = "Alchemy",
+  ["Alchemy Supplies"] = "Alchemy",
+  ["Food & Drink"]     = "Cooking",
+  ["Blasted Lands Buffs"] = "Cooking",
+  ["Cooking Supplies"] = "Cooking",
+  Bandages             = "First Aid",
+  Cloth                = "Tailoring",     -- Mooncloth only; others are mob drops, untracked
+  Parts                = "Engineering",
+  Explosives           = "Engineering",
+  ["Ores & Bars"]      = "Mining",        -- bars are smelted via Mining skill
+  Enchanting           = "Enchanting",
+}
+
+local ITEM_PROFESSION = {
+  -- Weapon Buffs splits across three professions:
+  [18262] = "Blacksmithing", -- Elemental Sharpening Stone
+  [12404] = "Blacksmithing", -- Dense Sharpening Stone
+  [7964]  = "Blacksmithing", -- Solid Sharpening Stone
+  [2871]  = "Blacksmithing", -- Heavy Sharpening Stone
+  [2863]  = "Blacksmithing", -- Coarse Sharpening Stone
+  [2862]  = "Blacksmithing", -- Rough Sharpening Stone
+  [12643] = "Blacksmithing", -- Dense Weightstone
+  [7965]  = "Blacksmithing", -- Solid Weightstone
+  [3241]  = "Blacksmithing", -- Heavy Weightstone
+  [3240]  = "Blacksmithing", -- Coarse Weightstone
+  [3239]  = "Blacksmithing", -- Rough Weightstone
+  [20749] = "Enchanting",    -- Brilliant Wizard Oil
+  [20750] = "Enchanting",    -- Wizard Oil
+  [20746] = "Enchanting",    -- Lesser Wizard Oil
+  [20748] = "Enchanting",    -- Brilliant Mana Oil
+  [20747] = "Enchanting",    -- Lesser Mana Oil
+  [3829]  = "Alchemy",       -- Frost Oil
+  [3824]  = "Alchemy",       -- Shadow Oil
+  -- Utility category splits:
+  [18232] = "Engineering",   -- Field Repair Bot 74A
+}
+
+function addon:GetProfession(itemID)
+  local override = ITEM_PROFESSION[itemID]
+  if override then return override end
+  local cat = self:GetItemCategory(itemID)
+  return (cat and CATEGORY_PROFESSION[cat]) or "Other"
+end
+
 -- itemID -> roundUpTo (gather list rounds an item's deficit up to this step).
 -- Used e.g. for E'kos that can only be turned in in groups of 3.
 local roundUpMap
@@ -553,6 +630,80 @@ function addon:ComputeFarmList()
     if a.score ~= b.score then return a.score > b.score end
     return a.zone < b.zone
   end)
+  return out
+end
+
+-- Group the craft list (from ComputeCraftList) by which characters can
+-- actually make each item, based on the per-character `crafts` set that
+-- gets populated as trade-skill windows are opened (and synced between
+-- paired accounts). Used by the "By character" view on the To-craft tab.
+--
+-- An item that's craftable on multiple alts appears under each of them;
+-- entries with no known crafter are bucketed under a final "No known
+-- crafter" group so the maintainer can see what they can't make yet.
+--
+-- Returns:
+--   { { name, isMine, isUnknown?, items = { <craft-list entries...> } }, ... }
+function addon:ComputeCraftListByCharacter()
+  local craftList = self:ComputeCraftList()
+  if not craftList or #craftList == 0 then return {} end
+
+  local byChar = {}  -- name -> { name, isMine, items = {} }
+  local noCrafter = {}
+
+  for _, entry in ipairs(craftList) do
+    local crafters = self:GetCrafters(entry.id)
+    if crafters and #crafters > 0 then
+      for _, c in ipairs(crafters) do
+        local bucket = byChar[c.name]
+        if not bucket then
+          bucket = { name = c.name, isMine = c.isMine, items = {} }
+          byChar[c.name] = bucket
+        end
+        bucket.items[#bucket.items + 1] = entry
+      end
+    else
+      noCrafter[#noCrafter + 1] = entry
+    end
+  end
+
+  -- Within each character bucket, sort items by:
+  --   1. Profession (alphabetical) — Alchemy items group, Engineering items
+  --      group, etc.
+  --   2. Section — Ingredients (intermediate parts like Stonescale Oil)
+  --      ahead of Consumables (end products like Flask of the Titans), so
+  --      the craft order matches typical play (make oil before flask).
+  --   3. Craft count descending — the biggest deficits first.
+  --   4. Item id ascending as a stable tiebreaker.
+  local function sortItems(items)
+    table.sort(items, function(a, b)
+      local pa, pb = addon:GetProfession(a.id), addon:GetProfession(b.id)
+      if pa ~= pb then return pa < pb end
+      local sa, sb = addon:GetItemSection(a.id), addon:GetItemSection(b.id)
+      if sa ~= sb then return sa == "Ingredients" end
+      if a.craft ~= b.craft then return a.craft > b.craft end
+      return a.id < b.id
+    end)
+  end
+
+  local out = {}
+  for _, b in pairs(byChar) do
+    sortItems(b.items)
+    out[#out + 1] = b
+  end
+  table.sort(out, function(a, b)
+    if a.isMine ~= b.isMine then return a.isMine end  -- own chars first
+    return a.name < b.name
+  end)
+  if #noCrafter > 0 then
+    sortItems(noCrafter)
+    out[#out + 1] = {
+      name = "No known crafter",
+      isMine = false,
+      isUnknown = true,
+      items = noCrafter,
+    }
+  end
   return out
 end
 

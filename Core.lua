@@ -270,6 +270,10 @@ local ITEM_PROFESSION = {
   [3824]  = "Alchemy",       -- Shadow Oil
   -- Utility category splits:
   [18232] = "Engineering",   -- Field Repair Bot 74A
+  -- Ores & Bars exceptions (the category defaults to Mining for smelting,
+  -- but two bars are made by other professions):
+  [12360] = "Alchemy",       -- Arcanite Bar (transmute, 4-day cooldown)
+  [12655] = "Enchanting",    -- Enchanted Thorium Bar
 }
 
 function addon:GetProfession(itemID)

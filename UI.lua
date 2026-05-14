@@ -1119,11 +1119,29 @@ local function MakeHeader(i)
   return h
 end
 
--- Toggle-all button: collapses every category in the current tab if any is
--- expanded, otherwise expands all. Categories come from addon.ITEMS so the
--- action works the same on the "To gather" tab (whose visible categories are
--- a subset of the regular tabs').
+-- Toggle-all button: collapses every category-equivalent on the current
+-- view if any is expanded, otherwise expands all. "Categories" depend on
+-- which view is active:
+--   - by-zone gather view: zone names from ComputeFarmList
+--   - by-character craft view: character names from ComputeCraftListByCharacter
+--   - everything else: addon.ITEMS categories (used for the regular tabs
+--     and the per-item gather/craft tabs whose visible categories are a
+--     subset of the regular tabs')
 local function AllCategories()
+  if currentTab == "To gather" and gatherByZone then
+    local out = {}
+    for _, zone in ipairs(addon:ComputeFarmList()) do
+      out[#out + 1] = zone.zone
+    end
+    return out
+  end
+  if currentTab == "To craft" and craftByCharacter then
+    local out = {}
+    for _, char in ipairs(addon:ComputeCraftListByCharacter()) do
+      out[#out + 1] = char.name
+    end
+    return out
+  end
   local cats, seen = {}, {}
   for _, section in pairs(addon.ITEMS) do
     for _, group in ipairs(section) do
@@ -1546,6 +1564,29 @@ end
 -- Craft column layout as the regular To-craft view.
 local function RenderCraftByCharacterTab()
   local list = addon:ComputeCraftListByCharacter()
+  -- Honor the "Craftable" filter checkbox: keep only items the character
+  -- can actually make right now (full or half craftability). Characters
+  -- whose entire item list is filtered out drop off the view.
+  if craftableOnly then
+    local filtered = {}
+    for _, char in ipairs(list) do
+      local kept = {}
+      for _, entry in ipairs(char.items) do
+        if entry.craftLevel == "full" or entry.craftLevel == "half" then
+          kept[#kept + 1] = entry
+        end
+      end
+      if #kept > 0 then
+        filtered[#filtered + 1] = {
+          name = char.name,
+          isMine = char.isMine,
+          isUnknown = char.isUnknown,
+          items = kept,
+        }
+      end
+    end
+    list = filtered
+  end
   local y, rIdx, hIdx, lblIdx = 0, 0, 0, 0
   content.profLabels = content.profLabels or {}
 

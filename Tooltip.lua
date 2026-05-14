@@ -61,28 +61,69 @@ local function AppendStockpile(tooltip)
   end
 
   -- "Sources:" — where the item can be obtained in the world (curated in
-  -- Items.lua per leaf item). Each entry has a kind (herb/mine/skin/fish/mob/
-  -- dungeon), a zone, a level range, and optionally a short mob list.
+  -- Items.lua per leaf item). Entries are sorted so same-kind sources are
+  -- contiguous; we emit one "<Kind>:" sub-header per group and indent the
+  -- zone lines beneath it. By default we show only zone + level range;
+  -- holding SHIFT expands each line with the mob list and drop chances.
+  -- The modifier-state listener at the bottom of this file re-fires this
+  -- function via SetHyperlink when SHIFT toggles so the tooltip updates
+  -- live while it's open.
   local sources = addon.GetSources and addon:GetSources(itemID)
   if sources and #sources > 0 then
+    local expand = IsShiftKeyDown()
+    local anyMobs = false
     tooltip:AddLine(" ")
     tooltip:AddLine("Sources:", 1, 0.82, 0)
+    local lastKind = nil
     for _, s in ipairs(sources) do
-      local kind = KIND_LABEL[s.kind] or s.kind or "?"
-      local line = ("  %s \194\183 %s"):format(kind, s.zone or "?")
+      if s.kind ~= lastKind then
+        local kind = KIND_LABEL[s.kind] or s.kind or "?"
+        tooltip:AddLine("  " .. kind .. ":", 1, 0.82, 0)
+        lastKind = s.kind
+      end
+      local line = "    " .. (s.zone or "?")
       if s.levels then line = line .. " (" .. s.levels .. ")" end
       if s.mobs and #s.mobs > 0 then
-        local parts = {}
-        for _, m in ipairs(s.mobs) do
-          if m.chance then
-            parts[#parts + 1] = ("%s (%s%%)"):format(m.name or "?", tostring(m.chance))
+        anyMobs = true
+        if expand then
+          local parts = {}
+          for _, m in ipairs(s.mobs) do
+            if m.chance then
+              parts[#parts + 1] = ("%s (%s%%)"):format(m.name or "?", tostring(m.chance))
+            else
+              parts[#parts + 1] = m.name or "?"
+            end
+          end
+          line = line .. " \226\128\148 " .. table.concat(parts, ", ")
+        elseif s.spawn_count then
+          -- Density + yield hint for mob/dungeon entries: approximate
+          -- number of dropping mobs spawned in this zone at any time
+          -- (summed from server-side spawn rows), plus the spawn-weighted
+          -- average drop chance across those mobs. Lets the player size
+          -- up a farming spot without expanding the mob list.
+          local plural = s.spawn_count == 1 and "" or "s"
+          if s.avg_chance then
+            line = line .. (" \226\128\148 ~%d mob%s (avg %s%%)"):format(
+              s.spawn_count, plural, tostring(s.avg_chance))
           else
-            parts[#parts + 1] = m.name or "?"
+            line = line .. (" \226\128\148 ~%d mob%s"):format(
+              s.spawn_count, plural)
           end
         end
-        line = line .. " \226\128\148 " .. table.concat(parts, ", ")
+      elseif s.spawn_count then
+        -- Node density + yield for herb / mine entries (no mob list).
+        local plural = s.spawn_count == 1 and "" or "s"
+        if s.avg_yield then
+          line = line .. (" \226\128\148 ~%d node%s (%s/node)"):format(
+            s.spawn_count, plural, tostring(s.avg_yield))
+        else
+          line = line .. (" \226\128\148 ~%d node%s"):format(s.spawn_count, plural)
+        end
       end
       tooltip:AddLine(line, 1, 1, 1)
+    end
+    if anyMobs and not expand then
+      tooltip:AddLine("  <Hold SHIFT for mob details>", 0.5, 0.5, 0.5)
     end
   end
 
@@ -141,3 +182,37 @@ end
 for _, tt in ipairs({ GameTooltip, ItemRefTooltip }) do
   if tt then tt:HookScript("OnTooltipSetItem", AppendStockpile) end
 end
+
+-- Refresh any open tracked-item tooltip when SHIFT presses/releases so the
+-- Sources section toggles between collapsed and expanded without the user
+-- having to re-hover. The mechanism differs by tooltip type:
+--   GameTooltip is typically anchored to a bag slot, inventory slot,
+--   merchant item, etc. SetHyperlink clobbers that anchor context, which
+--   leads to Blizzard's UI hiding the tooltip. Calling the owner's OnEnter
+--   handler instead rebuilds the tooltip in its proper context — OnEnter
+--   knows how to call SetBagItem / SetInventoryItem / etc with the right
+--   arguments. AppendStockpile then re-runs via OnTooltipSetItem with the
+--   current SHIFT state.
+--   ItemRefTooltip is the standalone chat-link popup with no owning frame,
+--   so SetHyperlink is both safe and correct there.
+local function RefreshOnShift(tt)
+  if not (tt and tt:IsShown()) then return end
+  local _, link = tt:GetItem()
+  local itemID = link and tonumber(link:match("item:(%d+)"))
+  if not (itemID and addon:IsTracked(itemID)) then return end
+  local owner = tt:GetOwner()
+  if owner and owner ~= UIParent and owner.GetScript then
+    local onEnter = owner:GetScript("OnEnter")
+    if onEnter then onEnter(owner) end
+  elseif tt == ItemRefTooltip then
+    tt:SetHyperlink(link)
+  end
+end
+
+local modFrame = CreateFrame("Frame")
+modFrame:RegisterEvent("MODIFIER_STATE_CHANGED")
+modFrame:SetScript("OnEvent", function(_, _, key)
+  if key ~= "LSHIFT" and key ~= "RSHIFT" then return end
+  RefreshOnShift(GameTooltip)
+  RefreshOnShift(ItemRefTooltip)
+end)

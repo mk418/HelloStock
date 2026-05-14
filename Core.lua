@@ -443,6 +443,119 @@ function addon:GetCraftSet()
   return set
 end
 
+-- Suggest farming zones based on the current gather list. For each item the
+-- user needs (from ComputeGatheringList), walk its sources and aggregate
+-- per-zone scores + per-hour throughput estimates.
+--
+-- Score: sum of "expected items per visit" across all needed items the zone
+-- can supply, capped at each item's deficit so a zone that overdrops one
+-- item doesn't out-rank one that hits multiple needs.
+--
+-- per_hour: realistic items-per-hour the zone delivers for each contributing
+-- item. Two grounded models:
+--   Open-world (respawn < 10min): capped at 60 kills/hr for mobs and
+--   30 gathers/hr for nodes — travel/kill/pickup dominate over raw spawn
+--   density, so the per-hour ceilings reflect realistic solo farming.
+--   Dungeon (respawn >= 10min, instance reset): assume 2 clears/hour, with
+--   per-clear yield = spawn_count × chance% (mob) or × yield (node).
+--
+-- Returns list sorted by score desc:
+--   { { zone, levels, score, items = { { id, needed, expected, capped,
+--       per_hour, kind, source } ... } }, ... }
+
+local FARM_OPENWORLD_MOB_PER_HOUR  = 60   -- ceiling: 1 kill / minute
+local FARM_OPENWORLD_NODE_PER_HOUR = 30   -- ceiling: 1 gather / 2 minutes
+local FARM_DUNGEON_CLEARS_PER_HOUR = 2    -- one clear every 30 min
+
+local function FarmYieldPerHour(s)
+  if not s.spawn_count then return nil end
+  local isInstance = (s.respawn and s.respawn >= 600)
+  if s.kind == "mob" or s.kind == "dungeon" then
+    if not s.avg_chance then return nil end
+    local perClear = s.spawn_count * s.avg_chance / 100
+    if isInstance then
+      return perClear * FARM_DUNGEON_CLEARS_PER_HOUR
+    end
+    -- Open-world: cap killable mobs/hour at the ceiling.
+    local effSpawns = math.min(s.spawn_count, FARM_OPENWORLD_MOB_PER_HOUR)
+    return effSpawns * s.avg_chance / 100
+  elseif s.kind == "herb" or s.kind == "mine" or s.kind == "skin" then
+    if not s.avg_yield then return nil end
+    local perClear = s.spawn_count * s.avg_yield
+    if isInstance then
+      return perClear * FARM_DUNGEON_CLEARS_PER_HOUR
+    end
+    local effSpawns = math.min(s.spawn_count, FARM_OPENWORLD_NODE_PER_HOUR)
+    return effSpawns * s.avg_yield
+  end
+  return nil
+end
+
+function addon:ComputeFarmList()
+  local out = {}
+  local gather = self:ComputeGatheringList()
+  if not gather or #gather == 0 then return out end
+
+  local need = {}
+  for _, entry in ipairs(gather) do
+    need[entry.id] = entry.gather
+  end
+
+  local zones = {}
+  for itemID, needed in pairs(need) do
+    local sources = self:GetSources(itemID)
+    if sources then
+      for _, s in ipairs(sources) do
+        local expected
+        if s.kind == "mob" or s.kind == "dungeon" then
+          if s.spawn_count and s.avg_chance then
+            expected = s.spawn_count * s.avg_chance / 100
+          end
+        elseif s.kind == "herb" or s.kind == "mine" or s.kind == "skin" then
+          if s.spawn_count and s.avg_yield then
+            expected = s.spawn_count * s.avg_yield
+          end
+        end
+        if expected and expected > 0 then
+          local capped = math.min(expected, needed)
+          local z = zones[s.zone]
+          if not z then
+            z = { zone = s.zone, levels = s.levels, score = 0, items = {} }
+            zones[s.zone] = z
+          end
+          z.score = z.score + capped
+          local perHour = FarmYieldPerHour(s)
+          local existing = z.items[itemID]
+          if not existing or expected > existing.expected then
+            z.items[itemID] = {
+              id = itemID,
+              needed = needed,
+              expected = expected,
+              capped = capped,
+              per_hour = perHour,
+              kind = s.kind,
+              source = s,
+            }
+          end
+        end
+      end
+    end
+  end
+
+  for _, z in pairs(zones) do
+    local items = {}
+    for _, info in pairs(z.items) do items[#items + 1] = info end
+    table.sort(items, function(a, b) return a.expected > b.expected end)
+    z.items = items
+    out[#out + 1] = z
+  end
+  table.sort(out, function(a, b)
+    if a.score ~= b.score then return a.score > b.score end
+    return a.zone < b.zone
+  end)
+  return out
+end
+
 -- Profession-recipe scanning. Tracks which tracked items each character can
 -- craft, based on what the open trade-skill / craft window exposes. The data
 -- is per-character (stored on HelloStockDB.characters[key].crafts) and is

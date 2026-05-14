@@ -195,6 +195,9 @@ local targetsOnly = false
 local inStockOnly = false
 local underTargetOnly = false
 local craftableOnly = false
+-- Switches the "To gather" tab between the default per-item list and a
+-- zones-to-farm aggregate view (see RenderFarmTab + ComputeFarmList).
+local gatherByZone = false
 local classFilter = nil  -- currently active filter (nil = "All classes", otherwise class name)
 local pickedClass = nil  -- last explicit dropdown choice (for the text-click toggle)
 local classFilterSource = "picked"  -- "picked" (dropdown / default) or "toggled" (text-clicked to player class)
@@ -233,10 +236,11 @@ end
 local function SaveFilters()
   -- Generic filters are shared across all characters on the account.
   UIStore().filters = {
-    inStock     = inStockOnly,
-    withTarget  = targetsOnly,
-    underTarget = underTargetOnly,
-    craftable   = craftableOnly,
+    inStock      = inStockOnly,
+    withTarget   = targetsOnly,
+    underTarget  = underTargetOnly,
+    craftable    = craftableOnly,
+    gatherByZone = gatherByZone,
   }
   -- Class filter is per-character: each toon picks the class context that
   -- matches whoever is logged in, not whatever an alt last set.
@@ -256,6 +260,7 @@ local function LoadFilters()
     targetsOnly     = f.withTarget  and true or false
     underTargetOnly = f.underTarget and true or false
     craftableOnly   = f.craftable   and true or false
+    gatherByZone    = f.gatherByZone and true or false
   end
   local cs = CharStore()
   classFilter       = cs.class
@@ -356,6 +361,17 @@ local craftableCheck = MakeFilterCheck("HelloStockCraftableCheck", "Craftable", 
 end)
 craftableCheck:ClearAllPoints()
 craftableCheck:SetPoint("LEFT", searchClear, "RIGHT", 4, 0)
+
+-- "By zone" toggle. Only shown on the "To gather" tab. When checked, the
+-- gather list renders as a ranked set of zones (where to farm efficiently
+-- given the current deficits) instead of a per-item list.
+local byZoneCheck = MakeFilterCheck("HelloStockByZoneCheck", "By zone", craftableCheck, function(self)
+  gatherByZone = self:GetChecked() and true or false
+  SaveFilters()
+  UI:Refresh()
+end)
+byZoneCheck:ClearAllPoints()
+byZoneCheck:SetPoint("LEFT", searchClear, "RIGHT", 4, 0)
 
 -- Class filter dropdown. Filters items that carry a `classes` field (mostly
 -- consumables); items without the field show regardless of selection.
@@ -693,6 +709,29 @@ local function MakeRow(i)
   row.gatherCount:SetJustifyH("RIGHT")
   row.gatherCount:Hide()
 
+  -- Columns used only by the "By zone" view (gather tab in zones mode).
+  -- Five right-aligned numeric columns, evenly spaced 42px apart:
+  --   Need / Drop % / Per node / Per hr / Hours.
+  -- Drop % is filled for mob/dungeon sources, Per node for herb/mine/skin —
+  -- splitting them avoids mixing two different units in one column.
+  -- Hours is the estimate of how long it'd take to satisfy the deficit at
+  -- the current Per hr rate. Hidden by default; visible only inside
+  -- RenderFarmTab.
+  local function _bzCol(rightOffset)
+    local fs = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    fs:SetPoint("RIGHT", row, "RIGHT", rightOffset, 0)
+    fs:SetWidth(42); fs:SetJustifyH("RIGHT"); fs:Hide()
+    return fs
+  end
+  -- Five columns, 42px wide. Most gaps are 6px; the Drop%-to-Per node gap
+  -- is widened to 18px so the wider "Per node" header label doesn't crowd
+  -- "Drop %" on the left.
+  row.bzNeed  = _bzCol(-218)
+  row.bzDrop  = _bzCol(-170)
+  row.bzYield = _bzCol(-110)
+  row.bzRate  = _bzCol(-62)
+  row.bzHours = _bzCol(-14)
+
   -- Hover overlays on the three craft-view numbers. Each shows a tooltip with
   -- the per-row recipe scaled to that number's quantity. Hold SHIFT to
   -- recursively expand sub-recipes down to raw ingredients.
@@ -987,6 +1026,21 @@ local function MakeHeader(i)
   h.targetLabel:SetText("Target")
   h.targetLabel:SetTextColor(0.85, 0.75, 0.5)
 
+  -- Column labels for the "By zone" view, matching the bz* columns in
+  -- MakeRow. Hidden by default; shown only when the byzone renderer
+  -- explicitly enables them.
+  local function _bzLabel(rightOffset, text)
+    local fs = h:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    fs:SetPoint("RIGHT", h, "RIGHT", rightOffset, 0)
+    fs:SetText(text); fs:SetTextColor(0.85, 0.75, 0.5); fs:Hide()
+    return fs
+  end
+  h.bzNeedLabel  = _bzLabel(-218, "Need")
+  h.bzDropLabel  = _bzLabel(-170, "Drop %")
+  h.bzYieldLabel = _bzLabel(-110, "Per node")
+  h.bzRateLabel  = _bzLabel(-62,  "Per hr")
+  h.bzHoursLabel = _bzLabel(-14,  "Hours")
+
   h.line = h:CreateTexture(nil, "BACKGROUND")
   h.line:SetColorTexture(1, 1, 1, 0.08)
   h.line:SetPoint("BOTTOMLEFT", 0, 0)
@@ -1204,6 +1258,196 @@ local function BindCharRow(row, entry)
   end)
 end
 
+-- "By zone" view of the gather tab: walks the gather list via
+-- ComputeFarmList, suggests zones to visit ranked by total expected items.
+-- Uses the same MakeHeader / MakeRow pool as the regular tabs so zones look
+-- and behave like category headers (click to collapse, persisted across
+-- reloads). Collapse state piggybacks on currentTab ("To gather") since
+-- physical zone names don't collide with the Ingredient/Consumable
+-- categories the by-item gather view doesn't actually collapse anyway.
+local function RenderFarmTab()
+  local list = addon:ComputeFarmList()
+  local y = 0
+
+  -- Search filters by zone name OR by any contributing item name — useful
+  -- for "where can I get Mageweave?" style queries. Item names are resolved
+  -- via GetItemInfo (uses Items.lua's name field as a fallback while the
+  -- client cache fills in).
+  if searchQuery ~= "" then
+    local filtered = {}
+    for _, zone in ipairs(list) do
+      local match = zone.zone:lower():find(searchQuery, 1, true) ~= nil
+      if not match then
+        for _, info in ipairs(zone.items) do
+          local nm = GetItemInfo(info.id)
+          if nm and nm:lower():find(searchQuery, 1, true) then
+            match = true; break
+          end
+        end
+      end
+      if match then filtered[#filtered + 1] = zone end
+    end
+    list = filtered
+  end
+
+  -- Empty state — no zones survived the gather-list / search filter.
+  if #list == 0 then
+    if not content.emptyMessage then
+      local fs = content:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+      fs:SetJustifyH("CENTER"); fs:SetWordWrap(true)
+      content.emptyMessage = fs
+    end
+    content.emptyMessage:ClearAllPoints()
+    content.emptyMessage:SetPoint("CENTER", scroll, "CENTER", 0, 0)
+    content.emptyMessage:SetWidth(scroll:GetWidth() - 40)
+    local hasTargets = false
+    for _ in pairs(addon:GetTargets().items) do hasTargets = true; break end
+    if hasTargets then
+      content.emptyMessage:SetTextColor(0.4, 1, 0.4)
+      content.emptyMessage:SetText("Nothing to farm right now — your targets are met.")
+    else
+      content.emptyMessage:SetTextColor(1, 0.82, 0)
+      content.emptyMessage:SetText("Set target stock levels first; this view suggests zones to visit based on your gather list.")
+    end
+    content.emptyMessage:Show()
+    content:SetHeight(math.max(scroll:GetHeight(), 1))
+    return
+  end
+
+  -- Format an items-per-hour rate.
+  local function fmtRate(r)
+    if not r or r <= 0 then return nil end
+    if r >= 10 then return ("~%d/hr"):format(math.floor(r + 0.5)) end
+    return ("~%.1f/hr"):format(r)
+  end
+
+  local rIdx, hIdx = 0, 0
+  for _, zone in ipairs(list) do
+    -- Zone header: clickable to collapse, with level range + total expected
+    -- shown on the right-hand side.
+    hIdx = hIdx + 1
+    local h = MakeHeader(hIdx)
+    h.category = zone.zone
+    h.text:SetText(zone.zone .. (zone.levels and ("  (" .. zone.levels .. ")") or ""))
+    local collapsed = IsCollapsed(currentTab, zone.zone)
+    if collapsed then
+      h.arrow:SetTexture("Interface\\Buttons\\UI-PlusButton-Up")
+    else
+      h.arrow:SetTexture("Interface\\Buttons\\UI-MinusButton-Up")
+    end
+    h.arrow:Show()
+    -- Five column labels for the byzone layout. Hide the regular labels so
+    -- they don't double-render.
+    h.stockLabel:Hide()
+    h.gatherMidLabel:Hide()
+    h.targetLabel:Hide()
+    h.bzNeedLabel:Show()
+    h.bzDropLabel:Show()
+    h.bzYieldLabel:Show()
+    h.bzRateLabel:Show()
+    h.bzHoursLabel:Show()
+    h:ClearAllPoints()
+    h:SetPoint("TOPLEFT", 0, -y)
+    h:Show()
+    y = y + 22
+
+    if not collapsed then
+      for _, info in ipairs(zone.items) do
+        rIdx = rIdx + 1
+        local row = MakeRow(rIdx)
+        -- Reset row state to a clean baseline; this view doesn't use the
+        -- target editbox / stock column.
+        row.craftableBg:Hide(); row.focusBg:Hide()
+        row.boundLock:Hide(); row.recipeKnown:Hide()
+        row.connectorV:Hide(); row.connectorH:Hide()
+        row.sep:Hide()
+        if row.targetBox then row.targetBox:Hide() end
+        row.count:SetText("")
+
+        -- row.itemID drives the hover tooltip (set by MakeRow's OnEnter).
+        -- Pooled rows retain the previous render's itemID — without this
+        -- line, hovering shows whichever item was last bound to this row.
+        row.itemID = info.id
+
+        local name, _, _, _, _, _, _, _, _, texture = GetItemInfo(info.id)
+        row.icon:SetTexture(texture or "Interface\\Icons\\INV_Misc_QuestionMark")
+        row.icon:SetAlpha(1)  -- ApplyVisual on the regular tabs dims icons
+        row.icon:Show()       -- for zero-stock + no-target items; reset.
+        row.name:SetText(name or ("Item " .. info.id))
+        row.name:SetTextColor(1, 1, 1)
+        row.name:SetAlpha(1)
+
+        -- Four right-aligned columns dedicated to the byzone view:
+        --   bzNeed  = "need N"          (yellow)
+        --   bzDrop  = drop % (mobs only)
+        --   bzYield = items per gather  (nodes only)
+        --   bzRate  = items per hour    (cyan)
+        -- gather*/count/target columns stay hidden here so the previous
+        -- per-item gather view's columns don't bleed through.
+        row.gatherNeed:Hide(); row.gatherStock:Hide(); row.gatherCount:Hide()
+
+        row.bzNeed:SetText(tostring(info.needed))
+        row.bzNeed:SetTextColor(1, 0.82, 0)
+        row.bzNeed:Show()
+
+        if info.kind == "mob" or info.kind == "dungeon" then
+          -- Drop % rounded to integer to keep the column compact (decimals
+          -- on a single-digit rate aren't actionable enough to be worth
+          -- the width). The full precision survives in info.source.
+          local pct = info.source.avg_chance
+          row.bzDrop:SetText(pct
+            and (math.floor(pct + 0.5) .. "%") or "—")
+          row.bzDrop:SetTextColor(1, 1, 1)
+          row.bzYield:SetText("—")
+          row.bzYield:SetTextColor(0.5, 0.5, 0.5)
+        else
+          row.bzDrop:SetText("—")
+          row.bzDrop:SetTextColor(0.5, 0.5, 0.5)
+          row.bzYield:SetText(info.source.avg_yield
+            and tostring(info.source.avg_yield) or "—")
+          row.bzYield:SetTextColor(1, 1, 1)
+        end
+        row.bzDrop:Show()
+        row.bzYield:Show()
+
+        -- Per-hour column shows just the number — the unit is in the header.
+        local rateNum, hoursNum
+        if info.per_hour and info.per_hour > 0 then
+          if info.per_hour >= 10 then
+            rateNum = tostring(math.floor(info.per_hour + 0.5))
+          else
+            rateNum = ("%.1f"):format(info.per_hour)
+          end
+          -- Estimated hours to satisfy this item's deficit alone in this
+          -- zone. Useful as a back-of-envelope ETA — see ComputeFarmList
+          -- for the per_hour model. Integer ≥10, one decimal otherwise.
+          local h_est = info.needed / info.per_hour
+          if h_est >= 10 then
+            hoursNum = tostring(math.floor(h_est + 0.5))
+          else
+            hoursNum = ("%.1f"):format(h_est)
+          end
+        end
+        row.bzRate:SetText(rateNum or "?")
+        row.bzRate:SetTextColor(0.55, 0.85, 1)
+        row.bzRate:Show()
+
+        row.bzHours:SetText(hoursNum or "?")
+        row.bzHours:SetTextColor(0.85, 0.85, 0.85)
+        row.bzHours:Show()
+
+        row:ClearAllPoints()
+        row:SetPoint("TOPLEFT", 0, -y)
+        row:Show()
+        y = y + 20
+      end
+    end
+    y = y + 4
+  end
+
+  content:SetHeight(math.max(y, scroll:GetHeight()))
+end
+
 local function RenderCharactersTab()
   local inScope, outOfScope = addon:GetCharOverview()
   local y, rIdx, hIdx = 0, 0, 0
@@ -1271,10 +1515,30 @@ function UI:Refresh()
     if r.targetBox and r.targetBox:HasFocus() then return end
   end
 
-  for _, r in ipairs(rowPool)     do r:Hide() end
+  for _, r in ipairs(rowPool)     do
+    r:Hide()
+    -- The byzone view shows row.bz* and hides the gather* / count / target
+    -- columns. Reset bz* to hidden here so they don't leak through to a
+    -- subsequent gather / regular-tab render that doesn't touch them.
+    if r.bzNeed  then r.bzNeed:Hide()  end
+    if r.bzDrop  then r.bzDrop:Hide()  end
+    if r.bzYield then r.bzYield:Hide() end
+    if r.bzRate  then r.bzRate:Hide()  end
+    if r.bzHours then r.bzHours:Hide() end
+  end
   for _, r in ipairs(charRowPool) do r:Hide() end
-  for _, h in ipairs(headerPool)  do h:Hide() end
+  for _, h in ipairs(headerPool)  do
+    h:Hide()
+    if h.bzNeedLabel  then h.bzNeedLabel:Hide()  end
+    if h.bzDropLabel  then h.bzDropLabel:Hide()  end
+    if h.bzYieldLabel then h.bzYieldLabel:Hide() end
+    if h.bzRateLabel  then h.bzRateLabel:Hide()  end
+    if h.bzHoursLabel then h.bzHoursLabel:Hide() end
+  end
   if content.emptyMessage then content.emptyMessage:Hide() end
+  if content.farmLines then
+    for _, fs in ipairs(content.farmLines) do fs:Hide() end
+  end
 
   -- Filter checkboxes don't apply on the meta tabs (gather / craft / chars).
   -- The class dropdown / toggle button only makes sense on the Consumables
@@ -1286,13 +1550,30 @@ function UI:Refresh()
   targetsCheck:SetShown(not listTab)
   underCheck:SetShown(not listTab)
   craftableCheck:SetShown(currentTab == "To craft")
+  byZoneCheck:SetShown(currentTab == "To gather")
+  byZoneCheck:SetChecked(gatherByZone)
   ApplyClassWidgetVisibility()
 
   if currentTab == "To gather" then
-    -- The gather view deliberately ignores the filter state from other tabs
-    -- (inStockOnly / targetsOnly / underTargetOnly / searchQuery). The list
-    -- shows every target with a deficit, regardless of those switches.
+    if gatherByZone then
+      RenderFarmTab()
+      return
+    end
+    -- The gather view ignores the in-stock / with-target / under-target
+    -- filter checkboxes (they don't make sense here — the list is built
+    -- from deficits already) but does honor the search box: typing
+    -- "mageweave" narrows the list to entries whose item name matches.
     local list = addon:ComputeGatheringList()
+    if searchQuery ~= "" then
+      local filtered = {}
+      for _, entry in ipairs(list) do
+        local nm = GetItemInfo(entry.id) or ""
+        if nm:lower():find(searchQuery, 1, true) then
+          filtered[#filtered + 1] = entry
+        end
+      end
+      list = filtered
+    end
     local y, rIdx, hIdx = 0, 0, 0
 
     if #list == 0 then

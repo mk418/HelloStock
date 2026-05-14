@@ -1,5 +1,18 @@
 local _, addon = ...
 
+local KIND_LABEL = {
+  herb       = "Herb",
+  mine       = "Mine",
+  skin       = "Skin",
+  fish       = "Fish",
+  mob        = "Mob",
+  dungeon    = "Dungeon",
+  vendor     = "Vendor",
+  disenchant = "Disenchant",
+  craft      = "Craft",
+  quest      = "Quest",
+}
+
 -- Returns true if the tooltip's current line list already contains our
 -- "Stockpile (N total):" header. We scan rather than using a remembered flag
 -- because GameTooltip can clear + rebuild its body mid-hover (item info
@@ -47,6 +60,32 @@ local function AppendStockpile(tooltip)
     end
   end
 
+  -- "Sources:" — where the item can be obtained in the world (curated in
+  -- Items.lua per leaf item). Each entry has a kind (herb/mine/skin/fish/mob/
+  -- dungeon), a zone, a level range, and optionally a short mob list.
+  local sources = addon.GetSources and addon:GetSources(itemID)
+  if sources and #sources > 0 then
+    tooltip:AddLine(" ")
+    tooltip:AddLine("Sources:", 1, 0.82, 0)
+    for _, s in ipairs(sources) do
+      local kind = KIND_LABEL[s.kind] or s.kind or "?"
+      local line = ("  %s \194\183 %s"):format(kind, s.zone or "?")
+      if s.levels then line = line .. " (" .. s.levels .. ")" end
+      if s.mobs and #s.mobs > 0 then
+        local parts = {}
+        for _, m in ipairs(s.mobs) do
+          if m.chance then
+            parts[#parts + 1] = ("%s (%s%%)"):format(m.name or "?", tostring(m.chance))
+          else
+            parts[#parts + 1] = m.name or "?"
+          end
+        end
+        line = line .. " \226\128\148 " .. table.concat(parts, ", ")
+      end
+      tooltip:AddLine(line, 1, 1, 1)
+    end
+  end
+
   -- "Can craft:" — characters in scope that know the recipe (data is captured
   -- from the trade-skill / craft windows and synced between paired accounts).
   local crafters = addon.GetCrafters and addon:GetCrafters(itemID)
@@ -73,14 +112,26 @@ local function AppendStockpile(tooltip)
     end
   end
 
-  -- "Used in:" — reverse lookup: which buffs in Items.lua reference this id as an ingredient.
+  -- "Needed for:" — buffs in Items.lua that (a) use this id as an ingredient
+  -- and (b) are currently in the craft list (target unmet, has a recipe).
+  -- Items we're not actively trying to craft are omitted; if nothing in our
+  -- to-craft list needs this ingredient, the section doesn't render at all.
   local usedIn = addon.GetUsedIn and addon:GetUsedIn(itemID)
-  if usedIn and #usedIn > 0 then
-    tooltip:AddLine(" ")
-    tooltip:AddLine("Used in:", 1, 0.82, 0)
+  if usedIn and #usedIn > 0 and addon.GetCraftSet then
+    local craftSet = addon:GetCraftSet()
+    local needed = {}
     for _, buffID in ipairs(usedIn) do
-      local buffName = GetItemInfo(buffID) or ("Item " .. buffID)
-      tooltip:AddLine("  " .. buffName, 1, 1, 1)
+      if craftSet[buffID] then
+        needed[#needed + 1] = buffID
+      end
+    end
+    if #needed > 0 then
+      tooltip:AddLine(" ")
+      tooltip:AddLine("Needed for:", 1, 0.82, 0)
+      for _, buffID in ipairs(needed) do
+        local buffName = GetItemInfo(buffID) or ("Item " .. buffID)
+        tooltip:AddLine("  " .. buffName, 1, 1, 1)
+      end
     end
   end
 

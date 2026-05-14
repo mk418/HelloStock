@@ -153,6 +153,35 @@ function addon:GetUsedIn(itemID)
   return usedInMap[itemID]
 end
 
+-- itemID -> array of source entries (see Items.lua for shape). Lazy.
+-- Each entry: { kind = "herb"|"mine"|"skin"|"fish"|"mob"|"dungeon"
+--                       |"vendor"|"disenchant"|"craft"|"quest",
+--               zone = "Place name", levels = "x-y",
+--               mobs = { { name = "Mob A", chance = 8 }, ... } }
+--               -- levels/mobs optional; chance is a percent (number), also optional
+--               -- For non-place kinds (vendor/disenchant/craft) the zone field
+--               -- carries the descriptive context (vendor NPC, ilvl band, etc.).
+local sourcesMap
+local function BuildSourcesMap()
+  if sourcesMap then return end
+  sourcesMap = {}
+  if not addon.ITEMS then return end
+  for _, section in pairs(addon.ITEMS) do
+    for _, group in ipairs(section) do
+      for _, item in ipairs(group.items) do
+        if item.id and item.sources then
+          sourcesMap[item.id] = item.sources
+        end
+      end
+    end
+  end
+end
+
+function addon:GetSources(itemID)
+  BuildSourcesMap()
+  return sourcesMap[itemID]
+end
+
 -- itemID -> category name (the group it belongs to in Items.lua).
 local categoryMap
 local function BuildCategoryMap()
@@ -401,6 +430,17 @@ function addon:ComputeCraftList()
     return a.id < b.id
   end)
   return out
+end
+
+-- Set of item IDs we need to craft right now (target > stock and has a recipe).
+-- Same demand-propagation logic as ComputeCraftList, returned as a set for
+-- cheap membership tests from the tooltip ("Needed for:" filter).
+function addon:GetCraftSet()
+  local set = {}
+  for _, entry in ipairs(self:ComputeCraftList()) do
+    set[entry.id] = true
+  end
+  return set
 end
 
 -- Profession-recipe scanning. Tracks which tracked items each character can

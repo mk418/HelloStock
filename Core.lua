@@ -77,6 +77,29 @@ function addon:IsTracked(itemID)
   return itemID and TrackedItemSet()[itemID] == true
 end
 
+-- Compact "ready in 1d 4h" / "12m" formatter for cooldown remainders. Drops
+-- the smaller unit once it's irrelevant (e.g. >1 day → days+hours, no minutes;
+-- under a minute → seconds). Used by the by-character craft view and the
+-- "Can craft:" tooltip section.
+function addon:FormatCooldown(secs)
+  if not secs or secs <= 0 then return nil end
+  if secs >= 86400 then
+    local d = math.floor(secs / 86400)
+    local h = math.floor((secs % 86400) / 3600)
+    if h > 0 then return ("%dd %dh"):format(d, h) end
+    return ("%dd"):format(d)
+  elseif secs >= 3600 then
+    local h = math.floor(secs / 3600)
+    local m = math.floor((secs % 3600) / 60)
+    if m > 0 then return ("%dh %dm"):format(h, m) end
+    return ("%dh"):format(h)
+  elseif secs >= 60 then
+    return ("%dm"):format(math.ceil(secs / 60))
+  else
+    return ("%ds"):format(secs)
+  end
+end
+
 -- Returns true if the item is Binds-on-Pickup. Auto-detected via GetItemInfo's
 -- bindType field (1=BoP, 2=BoE, 3=BoU, 4=quest). Only BoP matters for our
 -- stockpile case — BoE/BoU consumables can still be traded until used. Items
@@ -123,10 +146,15 @@ end
 -- Recipe lookups, built lazily from addon.ITEMS the first time anything asks.
 -- recipeMap[buffID]   -> array of { id = ingredientID, count = N }
 -- usedInMap[reagentID] -> array of buffIDs
-local recipeMap, usedInMap
+-- hasCooldownMap[itemID] -> true if the item's recipe has a cooldown
+--                          (Mooncloth, transmutes). Used by the by-character
+--                          margin column to render "+5g/cd" instead of
+--                          "+5g" — cooldown crafts can't be spammed so the
+--                          margin compares against a per-cycle frame.
+local recipeMap, usedInMap, hasCooldownMap
 local function BuildRecipeMaps()
   if recipeMap then return end
-  recipeMap, usedInMap = {}, {}
+  recipeMap, usedInMap, hasCooldownMap = {}, {}, {}
   if not addon.ITEMS then return end
   for _, section in pairs(addon.ITEMS) do
     for _, group in ipairs(section) do
@@ -137,6 +165,9 @@ local function BuildRecipeMaps()
             usedInMap[ing.id] = usedInMap[ing.id] or {}
             usedInMap[ing.id][#usedInMap[ing.id] + 1] = item.id
           end
+        end
+        if item.id and item.hasCooldown then
+          hasCooldownMap[item.id] = true
         end
       end
     end
@@ -151,6 +182,79 @@ end
 function addon:GetUsedIn(itemID)
   BuildRecipeMaps()
   return usedInMap[itemID]
+end
+
+-- Recipe-has-a-cooldown predicate. Driven off the curated `hasCooldown`
+-- flag on each item in Items.lua — we don't try to auto-detect because
+-- (a) the trade-skill API only reports the current cooldown when the
+-- window is open, and (b) "this recipe has *some* cooldown" is a
+-- compile-time property of the recipe, not runtime state.
+function addon:HasCooldown(itemID)
+  BuildRecipeMaps()
+  return hasCooldownMap[itemID] == true
+end
+
+-- Recursive cost of producing one of `itemID`. For each item:
+--   buy  = min(AH median, vendor price)
+--   build (if it has a recipe) = sum(ing cost × count) / yield
+--   result = min(buy, build), or whichever is available
+-- Used by GetCraftMargin and by the by-character margin column. Returns
+-- copper or nil if any leaf is missing a price (no false zeros).
+function addon:GetIngredientCost(itemID, _visited)
+  _visited = _visited or {}
+  if _visited[itemID] then return nil end  -- cycle guard, defensive
+  _visited[itemID] = true
+
+  local vendor = self.GetVendorPrice and self:GetVendorPrice(itemID) or nil
+  local mt = self.GetMarketPriceTypical and self:GetMarketPriceTypical(itemID) or nil
+  local marketPrice = mt and mt.median or nil
+  local buyPrice
+  if vendor and marketPrice then
+    buyPrice = math.min(vendor, marketPrice)
+  else
+    buyPrice = vendor or marketPrice
+  end
+
+  local recipe = self:GetRecipe(itemID)
+  local buildPrice
+  if recipe then
+    local total, complete = 0, true
+    for _, ing in ipairs(recipe) do
+      local cost = self:GetIngredientCost(ing.id, _visited)
+      if not cost then complete = false; break end
+      total = total + cost * (ing.count or 1)
+    end
+    if complete then
+      local yield = recipe.yield or 1
+      buildPrice = total / yield
+    end
+  end
+
+  _visited[itemID] = nil  -- pop from stack (only block cycles, not re-visits)
+
+  if buildPrice and buyPrice then return math.min(buildPrice, buyPrice) end
+  return buildPrice or buyPrice
+end
+
+-- Per-craft margin in copper, or nil if any leaf is missing a price.
+-- Sell side uses AH median for the produced item (we don't conflate with
+-- the buy-side min(vendor, AH) since selling at the vendor would be a
+-- mistake we don't want to model). Ingredient cost goes through
+-- GetIngredientCost so intermediates pick the cheaper of buy vs make.
+function addon:GetCraftMargin(itemID)
+  local recipe = self:GetRecipe(itemID)
+  if not recipe then return nil end
+  local mt = self.GetMarketPriceTypical and self:GetMarketPriceTypical(itemID) or nil
+  if not (mt and mt.median) then return nil end
+
+  local total = 0
+  for _, ing in ipairs(recipe) do
+    local cost = self:GetIngredientCost(ing.id)
+    if not cost then return nil end
+    total = total + cost * (ing.count or 1)
+  end
+  local yield = recipe.yield or 1
+  return mt.median * yield - total
 end
 
 -- itemID -> array of source entries (see Items.lua for shape). Lazy.
@@ -652,6 +756,21 @@ function addon:ComputeCraftListByCharacter()
   local craftList = self:ComputeCraftList()
   if not craftList or #craftList == 0 then return {} end
 
+  -- name-realm → { professions, cooldowns }, so each bucket can render rank
+  -- next to its profession sub-header and a "ready in Xd Yh" badge per row.
+  -- GetCrafters returns names in name-realm form, matching the keys here.
+  local sideDataByName = {}
+  if HelloStockDB and HelloStockDB.characters then
+    for _, c in pairs(HelloStockDB.characters) do
+      if c.name and c.realm then
+        sideDataByName[c.name .. "-" .. c.realm] = {
+          professions = c.professions,
+          cooldowns   = c.cooldowns,
+        }
+      end
+    end
+  end
+
   local byChar = {}  -- name -> { name, isMine, items = {} }
   local noCrafter = {}
 
@@ -661,7 +780,14 @@ function addon:ComputeCraftListByCharacter()
       for _, c in ipairs(crafters) do
         local bucket = byChar[c.name]
         if not bucket then
-          bucket = { name = c.name, isMine = c.isMine, items = {} }
+          local sd = sideDataByName[c.name] or {}
+          bucket = {
+            name = c.name,
+            isMine = c.isMine,
+            professions = sd.professions,
+            cooldowns   = sd.cooldowns,
+            items = {},
+          }
           byChar[c.name] = bucket
         end
         bucket.items[#bucket.items + 1] = entry
@@ -725,6 +851,119 @@ local function MarkCanCraft(itemID)
   return true
 end
 
+-- Cooldown capture for transmutes (Arcanite, Mooncloth, etc.). The trade-skill
+-- API returns remaining seconds — we persist the absolute readyAt (time() + cd)
+-- so the value survives /reload and syncs meaningfully across peers (time() is
+-- Unix epoch, so it's machine-independent modulo clock drift). Drift under a
+-- minute is ignored so re-opening the trade window doesn't churn the table.
+local function MarkCooldown(itemID, readyAt)
+  if not itemID or not addon:IsTracked(itemID) then return false end
+  if not readyAt or readyAt <= time() then return false end
+  local c = addon:GetSelf()
+  if not c then return false end
+  c.cooldowns = c.cooldowns or {}
+  local existing = c.cooldowns[itemID]
+  if existing and math.abs(existing - readyAt) < 60 then return false end
+  c.cooldowns[itemID] = readyAt
+  if addon.ScheduleCooldownAlert then
+    addon:ScheduleCooldownAlert(MyKey(), itemID, readyAt)
+  end
+  return true
+end
+
+-- Chat-alert plumbing for cooldowns. Each known own-account char + tracked
+-- itemID pair can have at most one armed timer; recapturing (drift outside
+-- the MarkCooldown 60s window) cancels and re-arms it. The handler clears
+-- the cooldown entry so the by-character view stops badging the row and a
+-- subsequent /reload doesn't print the message a second time.
+local cdTimers = {}  -- charKey .. ":" .. itemID → C_Timer handle
+
+local function CooldownAlertKey(charKey, itemID)
+  return charKey .. ":" .. itemID
+end
+
+local function FireCooldownReady(charKey, itemID)
+  cdTimers[CooldownAlertKey(charKey, itemID)] = nil
+  local c = HelloStockDB and HelloStockDB.characters
+            and HelloStockDB.characters[charKey]
+  if not c or not c.cooldowns then return end
+  local readyAt = c.cooldowns[itemID]
+  if not readyAt or readyAt > time() then return end  -- rescheduled meanwhile
+  c.cooldowns[itemID] = nil
+  local itemName = GetItemInfo(itemID) or ("Item " .. itemID)
+  print(("|cffffd200[HelloStock]|r %s's %s cooldown is ready."):format(
+    c.name or "?", itemName))
+  if addon.UI and addon.UI:IsShown() then addon.UI:Refresh() end
+end
+
+function addon:ScheduleCooldownAlert(charKey, itemID, readyAt)
+  if not charKey or not itemID then return end
+  local key = CooldownAlertKey(charKey, itemID)
+  local existing = cdTimers[key]
+  if existing then existing:Cancel(); cdTimers[key] = nil end
+  if not readyAt then return end
+  local secs = readyAt - time()
+  if secs <= 0 then return end
+  cdTimers[key] = C_Timer.NewTimer(secs, function()
+    FireCooldownReady(charKey, itemID)
+  end)
+end
+
+-- Cancel any armed cooldown alerts for a character. Called when an incoming
+-- snapshot replaces their cooldown table (peer cleared an entry their side,
+-- timer locally would still fire otherwise) and from RescheduleCooldownsFor.
+local function CancelCooldownAlertsFor(charKey)
+  if not charKey then return end
+  local prefix = charKey .. ":"
+  for k, timer in pairs(cdTimers) do
+    if k:sub(1, #prefix) == prefix then
+      timer:Cancel()
+      cdTimers[k] = nil
+    end
+  end
+end
+
+-- After a snapshot replaces a character's cooldown table, wipe any prior
+-- timers for that character and arm new ones from the fresh state. Items
+-- that were on cooldown in the previous snapshot but are missing now (peer
+-- crafted them or they expired peer-side) end up cancelled with no replay.
+function addon:RescheduleCooldownsFor(charKey)
+  CancelCooldownAlertsFor(charKey)
+  local c = HelloStockDB and HelloStockDB.characters
+            and HelloStockDB.characters[charKey]
+  if not c or not c.cooldowns then return end
+  for id, readyAt in pairs(c.cooldowns) do
+    self:ScheduleCooldownAlert(charKey, id, readyAt)
+  end
+end
+
+-- Login-time sweep: anything that ran out while offline collects into one
+-- summary line ("Cooldowns ready: Brokk — Arcanite Bar, Thargas — Mooncloth")
+-- and is cleared; anything still active arms a timer for its remaining time.
+-- Covers every character in scope (own and peer-account) so the player sees
+-- their alt-army's cooldowns coming up regardless of which account it's on.
+function addon:SweepCooldowns()
+  if not HelloStockDB or not HelloStockDB.characters then return end
+  local ready = {}
+  for k, c in pairs(HelloStockDB.characters) do
+    if c.cooldowns then
+      for id, readyAt in pairs(c.cooldowns) do
+        if readyAt <= time() then
+          local n = GetItemInfo(id) or ("Item " .. id)
+          ready[#ready + 1] = (c.name or "?") .. " \226\128\148 " .. n
+          c.cooldowns[id] = nil
+        else
+          self:ScheduleCooldownAlert(k, id, readyAt)
+        end
+      end
+    end
+  end
+  if #ready > 0 then
+    print(("|cffffd200[HelloStock]|r Cooldowns ready: %s"):format(
+      table.concat(ready, ", ")))
+  end
+end
+
 -- Reverse lookup: localized item name → tracked itemID. Built lazily because
 -- GetItemInfo needs the item to be in the cache (PrimeItemCache on login
 -- usually handles that). Used as a fallback when the trade-skill / craft
@@ -775,6 +1014,12 @@ local function ScanTradeSkillsNow()
       local link = GetTradeSkillItemLink and GetTradeSkillItemLink(i)
       local id   = ResolveItemID(link, skillName)
       if id and MarkCanCraft(id) then changed = true end
+      if id and GetTradeSkillCooldown then
+        local cd = GetTradeSkillCooldown(i)
+        if cd and cd > 0 and MarkCooldown(id, time() + cd) then
+          changed = true
+        end
+      end
     end
   end
   return changed
@@ -1269,6 +1514,7 @@ function addon:ReceiveSnapshot(snap, senderHash)
     level         = snap.level or (existing and existing.level) or nil,
     professions   = snap.professions or (existing and existing.professions) or nil,
     crafts        = snap.crafts or {},
+    cooldowns     = snap.cooldowns or (existing and existing.cooldowns) or nil,
     money         = snap.money or (existing and existing.money) or 0,
     bagsUpdated   = snap.ts or 0,
     bankUpdated   = snap.ts or 0,
@@ -1277,6 +1523,10 @@ function addon:ReceiveSnapshot(snap, senderHash)
     source        = isMine and "self" or "sync",
     sourceSecret  = isMine and nil or senderHash,
   }
+  -- Re-arm timers for this character against the new cooldown state. Wipes
+  -- any prior timers first so an entry the peer cleared on their side
+  -- (transmute consumed, manual reset) doesn't still fire locally.
+  self:RescheduleCooldownsFor(key)
   RefreshUI()
   if self.RefreshOptions then self:RefreshOptions() end
   -- If auto-friend is on and we just learned about a peer character,
@@ -1367,8 +1617,9 @@ function addon:GetCrafters(itemID)
     if c.faction == myFaction and c.realm and realmSet[self:NormalizeRealm(c.realm)]
        and c.crafts and c.crafts[itemID] then
       out[#out + 1] = {
-        name   = (c.name or "?") .. "-" .. (c.realm or "?"),
-        isMine = c.accountID == myID,
+        name    = (c.name or "?") .. "-" .. (c.realm or "?"),
+        isMine  = c.accountID == myID,
+        readyAt = c.cooldowns and c.cooldowns[itemID],
       }
     end
   end
@@ -1582,6 +1833,7 @@ function addon:GetCharOverview()
         outboxItems = c.outbox and #c.outbox or 0,
         pendingMail = inboxItemCount,  -- inbox items; in-transit added in pass 2
         crafts      = c.crafts,
+        cooldowns   = c.cooldowns,
         professions = c.professions,
       }
       local realmOK = c.realm and realmSet[addon:NormalizeRealm(c.realm)]
@@ -1707,6 +1959,10 @@ f:SetScript("OnEvent", function(_, event)
     PrimeItemCache()
     UpdateBags()
     UpdateProfessions()
+    -- Sweep cooldowns once item names are likely in the cache. Reports any
+    -- own-account recipe whose cooldown ran out while offline and arms a
+    -- timer for those still active so we ping when they come up mid-session.
+    C_Timer.After(2, function() addon:SweepCooldowns() end)
     -- The spellbook isn't always populated by PLAYER_LOGIN; gathering
     -- professions in particular sometimes return nil from GetProfessions()
     -- at this point. Retry a few seconds in. SPELLS_CHANGED also fires

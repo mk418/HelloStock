@@ -246,13 +246,15 @@ HelloStock/
 ├── Comm.lua        -- addon-whisper protocol: pair, snapshot, targets, ping
 ├── Core.lua        -- DB shape, bag/bank scan, account ID, secret hash,
 │                   -- slash commands, GetTotals aggregation
+├── Prices.lua      -- optional Auctionator integration: market price
+│                   -- ring buffer, vendor cost wrapper, format helpers
 ├── Tooltip.lua     -- OnTooltipSetItem hook for GameTooltip + ItemRefTooltip
 ├── UI.lua          -- main window, tabs, rows, filters, target editing
 ├── Minimap.lua     -- native minimap button (no LibDBIcon)
 └── Options.lua     -- Blizzard options panel
 ```
 
-Each file owns one concern. `Core.lua` is the only one that touches `HelloStockDB` keys other than the file's own (UI owns `ui.*`, Minimap owns `minimap.*`, Core owns `characters` / `targets` / `secret` / `accountID` / `debug`).
+Each file owns one concern. `Core.lua` is the only one that touches `HelloStockDB` keys other than the file's own (UI owns `ui.*`, Minimap owns `minimap.*`, Core owns `characters` / `targets` / `secret` / `accountID` / `debug`, Prices owns `prices.*`).
 
 ---
 
@@ -265,6 +267,107 @@ Lives in `Items.lua` as `addon.ITEMS = { Ingredients = { ... }, Consumables = { 
 Within each group, items are ordered **greatest tier first, smallest tier last**. For paired-tier items (Heavy Runecloth + Runecloth, Greater Frost Protection + Frost Protection, Mithril Bar + Mithril Ore), the higher/refined member comes first. Items without a tier ladder (different schools, different stats) are grouped by their type and that type's items appear contiguously. Protection Potions specifically are alphabetised by school (Arcane → Shadow), with Greater + regular adjacent per school.
 
 This is the only ordering rule. There's no alphabetical sort, no auto-detection of tier — the order in `Items.lua` is the order in the UI.
+
+---
+
+## Per-item sources schema
+
+Most items in `Items.lua` carry a `sources` field listing where the item can be obtained in the world. The data drives the "Sources:" section of the tooltip, the by-zone toggle of the *To gather* tab, and the items-per-hour farming model. Items intentionally without sources (e.g. Crystal Vials, Soothing Spices — buyable almost anywhere) leave the field unset; the tooltip section is just skipped.
+
+```lua
+{ id = 13463, name = "Dreamfoil",
+  sources = {
+    { kind = "herb", zone = "Un'Goro Crater", levels = "48-55",
+      spawn_count = 42, avg_yield = 1.4 },
+    { kind = "mob",  zone = "Stratholme", levels = "58-60",
+      spawn_count = 18, avg_chance = 2.3,
+      mobs = {
+        { name = "Crypt Slayer",  chance = 4 },
+        { name = "Crypt Stalker", chance = 2 },
+      } },
+  },
+},
+```
+
+### Entry shape
+
+| Field | Type | Used by | Notes |
+|---|---|---|---|
+| `kind` | string | grouping, label, yield model | One of `herb`, `mine`, `skin`, `fish`, `mob`, `dungeon`, `vendor`, `disenchant`, `craft`, `quest`. Group label comes from `KIND_LABEL` in `Tooltip.lua` |
+| `zone` | string | tooltip line, by-zone aggregation, *To gather* hour estimate | The visible zone or sub-zone name. Dungeons use their dungeon name, not the parent continent |
+| `levels` | string (optional) | tooltip line, level-tinted zone headers | Human-readable range like `"50-60"`. Single-level zones can use a single number. Used to tint zone headers in the by-zone view; missing values render uncoloured |
+| `mobs` | list (optional) | SHIFT-expand mob detail | Only on `mob` / `dungeon` entries. Each `{ name, chance }` where `chance` is the drop percentage as a number (no `%` suffix). Tooltip shows the list verbatim when SHIFT is held |
+| `spawn_count` | number (optional) | tooltip density hint, items-per-hour rate | For `mob`/`dungeon`: approximate number of dropping mobs alive in the zone at any time. For `herb`/`mine`: number of nodes |
+| `avg_chance` | number (optional) | tooltip density hint, items-per-hour rate | Spawn-weighted average drop percent across the listed mobs. Used so a single rare drop on a 1000-spawn mob and a 100% drop on a 10-spawn mob both produce sensible per-hour numbers |
+| `avg_yield` | number (optional) | tooltip density hint, items-per-hour rate | For `herb` / `mine`: average items per gathered node (e.g. `1.4` for a node that mostly yields 1 but sometimes 2) |
+
+### Ordering
+
+Within an item's `sources` list, entries are sorted so same-`kind` rows are contiguous. The tooltip renders one `<Kind>:` sub-header per group and indents the zone lines beneath it. Beyond same-kind grouping the order is preserved from the data file — it generally reflects "best farming spot first."
+
+### Yield model
+
+`FarmYieldPerHour(s)` in `Core.lua` reads `spawn_count`, `avg_chance` / `avg_yield`, and a per-`kind` ceiling to produce the *Per hr* column in the by-zone view:
+
+- `mob`: `min(spawn_count, 60)` kills per hour × `avg_chance / 100`
+- `dungeon`: `min(spawn_count, 2 clears worth)` × `avg_chance / 100`
+- `herb` / `mine`: `min(spawn_count, 30)` gathers per hour × `avg_yield`
+- `skin` / `fish`: fall back to the kind's cap with `avg_chance` or `avg_yield` if provided
+
+The Hours column caps at `10+` so single-source long-tail farms don't drown the list. The 60-kills / 30-gathers / 2-clears ceilings are deliberately under what a sweat-tryhard could push — they reflect realistic "I'm farming this for an hour" pace, including respawn waits and travel.
+
+---
+
+## Market-price integration
+
+HelloStock reads auction-house prices via [Auctionator](https://www.curseforge.com/wow/addons/auctionator-classic)'s public v1 API when it's installed. The integration is optional — without Auctionator the addon works as before, just without price columns and tooltip lines.
+
+### API surface used
+
+- `Auctionator.API.v1.GetAuctionPriceByItemID("HelloStock", itemID)` — current observed AH price for an item, in copper (or nil if Auctionator has no data for it).
+- `Auctionator.API.v1.RegisterForDBUpdate("HelloStock", callback)` — fires after every Auctionator scan. We use this to capture *accurate* scan-time timestamps for our own price history — the v1 API does not expose scan time on the price-retrieval methods themselves.
+- `Auctionator.API.v1.GetVendorPriceByItemID("HelloStock", itemID)` — vendor cost for ingredients like Crystal Vials. Used inside the recursive ingredient-cost computation so buy-vs-make math is right for recipes with vendor reagents.
+
+`## OptionalDeps: Auctionator` is declared in the TOC. All price calls are gated by a presence check so HelloStock keeps loading cleanly when the dependency is missing.
+
+### Storage
+
+```lua
+HelloStockDB.prices = {
+  ["Horde@Greymane,Mankrik"] = {   -- addon:ScopeKey()
+    [13510] = {                    -- itemID → ring buffer
+      { price = 92000, ts = 1715534512 },
+      { price = 89500, ts = 1715448000 },
+      ...                          -- ~10 most recent
+    },
+    ...
+  },
+}
+```
+
+Keyed by `addon:ScopeKey()` — the same faction-plus-connected-realm-cluster key the targets and stockpile aggregation already use. Format is `<faction>@<sortedRealms,joined,with,commas>`. Connected realms share an AH in Classic Era, so any cluster character's observations populate the same history; reusing `ScopeKey` keeps everything cluster-scoped consistent across the addon.
+
+### Sampling
+
+Each Auctionator scan triggers our `RegisterForDBUpdate` callback. We walk the tracked-items set, call `GetAuctionPriceByItemID` for each, and append a new `{ price, ts = time() }` entry to that item's ring buffer when the value differs from the previous entry (no-op append is dropped to save storage on dead items). Items not seen on the AH return nil and are skipped.
+
+`addon:GetMarketPriceTypical(itemID)` is the read API for display sites — returns `{ current, median, newestTs }` (or nil if no data) computed from the ring buffer. Median is the headline price (robust against single-listing outliers); current is the most-recent observation; newestTs feeds the "last scanned N hours ago" age display.
+
+### Display sites (phased)
+
+The price data feeds four user-visible surfaces, each independently shippable:
+
+1. **Tooltip** — one `AH: 8g 50s  (typical 11g, last scanned 2h ago)` line in the Stockpile section. Dimmed grey when the newest sample is >7 days old. Skipped entirely when Auctionator isn't loaded.
+
+2. **By-zone "To gather" view** — adds a `g/hr` column = `per_hour × median_price`. A "By gold" filter checkbox re-sorts the view descending by `g/hr` instead of by hours-to-target.
+
+3. **By-character "To craft" view** — adds a margin column. Per-craft margin is `(sell median × yield) − ingredient cost`, where ingredient cost recurses via `recipeMap`: for each ingredient take `min(buy AH median, recursive build cost)`. Vendor-only ingredients (Crystal Vials etc.) use `GetVendorPriceByItemID`. Cooldown items display margin as `+5g/cd` (literal "cd"), independent of the actual cooldown length — Mooncloth's 4-day cycle and Arcanite's 2-day cycle both render `/cd` so they compare cleanly. A "By margin" filter checkbox re-sorts descending by margin. Margin is *omitted* (not shown as 0) when any leaf ingredient has no price — false zeros mislead.
+
+4. **Opportunities lens (deferred — see TODO)** — a stockpile-target-ignoring view ranking "positive-margin crafts to do right now" and "highest g/hr farms in the tracked set." Held back until 1–3 prove the price data is reliable in practice.
+
+### Why this scope, not more
+
+HelloStock is a stockpile companion. Tying AH data into the existing views answers "should I buy this instead of farming it?" and "is this craft worth doing?" without expanding the product into auction-flipping or stockpile-irrelevant gold farming — that's TSM's job. The Opportunities lens (#4) sits on the border, which is why it's gated on the rest proving out first.
 
 ---
 
@@ -441,6 +544,9 @@ A reasonable counter-argument is "what about raw ingredients listed speculativel
 ### Reliability
 - [ ] First-load schema migration logic if anything in `HelloStockDB` ever needs renaming (currently stale keys are harmless but accumulate)
 - [ ] PTR smoke test before each Classic Era patch (load, scan, sync handshake, tooltip extension, minimap drag, /reload mid-edit)
+
+### Market-price integration
+- [ ] **Opportunities lens (phase 5).** Once tooltip, by-zone `g/hr`, and by-character margin (phases 1–4 in "Market-price integration" above) have proven the price data is reliable in practice, evaluate adding a fourth view mode that ignores stockpile targets and surfaces "positive-margin crafts to do right now" + "highest g/hr farms in the tracked set." Decision criteria: do existing views answer the gold-making question well enough on their own? If yes, skip; the curated-list discipline is more valuable than the extra surface.
 
 ---
 

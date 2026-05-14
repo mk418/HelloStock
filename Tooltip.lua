@@ -60,6 +60,61 @@ local function AppendStockpile(tooltip)
     end
   end
 
+  -- AH price line — only rendered when Auctionator is installed and has
+  -- seen the item at least once. Current observation is the headline; the
+  -- parenthetical adds the rolling median ("typical") and the age of the
+  -- newest sample. The whole line dims grey once the data is >7 days old
+  -- so the user sees at a glance that the price is stale.
+  local price = addon.GetMarketPriceTypical and addon:GetMarketPriceTypical(itemID)
+  if price and price.current then
+    local now = time()
+    local stale = price.newestTs and (now - price.newestTs > 7 * 86400)
+    local headColor = stale and "|cff808080" or "|cffffffff"
+    local subColor  = "|cff808080"
+
+    local parts = {}
+    -- Skip the "typical" parenthetical when it would just repeat the
+    -- current value (single sample, identical median).
+    if price.median and math.abs(price.median - price.current) >= 100 then
+      parts[#parts + 1] = "typical " .. addon:FormatPrice(price.median)
+    end
+    if price.newestTs then
+      local ago = now - price.newestTs
+      local ageStr
+      if ago < 60 then
+        ageStr = "just now"
+      elseif ago < 3600 then
+        ageStr = ("%dm ago"):format(math.floor(ago / 60))
+      elseif ago < 86400 then
+        ageStr = ("%dh ago"):format(math.floor(ago / 3600))
+      else
+        ageStr = ("%dd ago"):format(math.floor(ago / 86400))
+      end
+      parts[#parts + 1] = ageStr
+    end
+
+    local line = headColor .. "AH: " .. addon:FormatPrice(price.current) .. "|r"
+    if #parts > 0 then
+      line = line .. "  " .. subColor .. "(" .. table.concat(parts, ", ") .. ")|r"
+    end
+    tooltip:AddLine(line)
+  end
+
+  -- Craft margin line — only when the item has a recipe and we can
+  -- actually compute the margin (all leaf ingredients priced). Uses the
+  -- same FormatMargin helper as the by-character column so the numbers
+  -- match between the two surfaces. "/cd" suffix surfaces transmutes
+  -- (Arcanite Bar, Mooncloth) as cycle-gated.
+  if addon.GetCraftMargin and addon:GetRecipe(itemID) then
+    local margin = addon:GetCraftMargin(itemID)
+    if margin then
+      local text, r, g, b = addon:FormatMargin(margin, addon:HasCooldown(itemID))
+      if text then
+        tooltip:AddDoubleLine("Craft margin:", text, 1, 0.82, 0, r, g, b)
+      end
+    end
+  end
+
   -- "Sources:" — where the item can be obtained in the world (curated in
   -- Items.lua per leaf item). Entries are sorted so same-kind sources are
   -- contiguous; we emit one "<Kind>:" sub-header per group and indent the
@@ -129,6 +184,8 @@ local function AppendStockpile(tooltip)
 
   -- "Can craft:" — characters in scope that know the recipe (data is captured
   -- from the trade-skill / craft windows and synced between paired accounts).
+  -- If a character is on cooldown for this recipe (transmutes, Mooncloth) the
+  -- remaining time is appended in a dim "ready in 1d 4h" tag.
   local crafters = addon.GetCrafters and addon:GetCrafters(itemID)
   if crafters and #crafters > 0 then
     tooltip:AddLine(" ")
@@ -136,7 +193,14 @@ local function AppendStockpile(tooltip)
     for _, x in ipairs(crafters) do
       local r, g, b = 1, 1, 1
       if not x.isMine then r, g, b = 0.6, 0.6, 0.6 end
-      tooltip:AddLine("  " .. x.name, r, g, b)
+      local line = "  " .. x.name
+      if x.readyAt and x.readyAt > time() then
+        local note = addon:FormatCooldown(x.readyAt - time())
+        if note then
+          line = line .. "  |cffaa7777(ready in " .. note .. ")|r"
+        end
+      end
+      tooltip:AddLine(line, r, g, b)
     end
   end
 

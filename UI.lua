@@ -198,9 +198,17 @@ local craftableOnly = false
 -- Switches the "To gather" tab between the default per-item list and a
 -- zones-to-farm aggregate view (see RenderFarmTab + ComputeFarmList).
 local gatherByZone = false
+-- Re-sorts the by-zone view by gold-per-hour descending (zones, and items
+-- within each zone). Default sort is by expected-items / zone score.
+-- Only meaningful when gatherByZone is on; the toggle is hidden otherwise.
+local gatherByGold = false
 -- Switches the "To craft" tab between the default per-item list and a
 -- per-character grouping (see RenderCraftByCharacterTab).
 local craftByCharacter = false
+-- Re-sorts items within each character bucket by margin desc when in
+-- by-character mode. Only meaningful when craftByCharacter is on; the
+-- toggle is hidden otherwise.
+local craftByMargin = false
 local classFilter = nil  -- currently active filter (nil = "All classes", otherwise class name)
 local pickedClass = nil  -- last explicit dropdown choice (for the text-click toggle)
 local classFilterSource = "picked"  -- "picked" (dropdown / default) or "toggled" (text-clicked to player class)
@@ -244,7 +252,9 @@ local function SaveFilters()
     underTarget      = underTargetOnly,
     craftable        = craftableOnly,
     gatherByZone     = gatherByZone,
+    gatherByGold     = gatherByGold,
     craftByCharacter = craftByCharacter,
+    craftByMargin    = craftByMargin,
   }
   -- Class filter is per-character: each toon picks the class context that
   -- matches whoever is logged in, not whatever an alt last set.
@@ -265,7 +275,9 @@ local function LoadFilters()
     underTargetOnly  = f.underTarget and true or false
     craftableOnly    = f.craftable   and true or false
     gatherByZone     = f.gatherByZone     and true or false
+    gatherByGold     = f.gatherByGold     and true or false
     craftByCharacter = f.craftByCharacter and true or false
+    craftByMargin    = f.craftByMargin    and true or false
   end
   local cs = CharStore()
   classFilter       = cs.class
@@ -376,6 +388,17 @@ end)
 byZoneCheck:ClearAllPoints()
 byZoneCheck:SetPoint("LEFT", searchClear, "RIGHT", 4, 0)
 
+-- "By gold" toggle. Re-sorts the by-zone view by gold-per-hour (zones, and
+-- items within each zone). Only meaningful in by-zone mode, so it's only
+-- shown when both currentTab == "To gather" and gatherByZone is on.
+local byGoldCheck = MakeFilterCheck("HelloStockByGoldCheck", "By gold", byZoneCheck, function(self)
+  gatherByGold = self:GetChecked() and true or false
+  SaveFilters()
+  UI:Refresh()
+end)
+byGoldCheck:ClearAllPoints()
+byGoldCheck:SetPoint("LEFT", _G["HelloStockByZoneCheckText"] or byZoneCheck, "RIGHT", 6, 0)
+
 -- "By character" toggle. Only shown on the "To craft" tab. When checked,
 -- the craft list groups items by which character can make them — useful
 -- when crafts are spread across alts.
@@ -390,6 +413,17 @@ byCharCheck:ClearAllPoints()
 byCharCheck:SetPoint("LEFT", searchClear, "RIGHT", 4, 0)
 craftableCheck:ClearAllPoints()
 craftableCheck:SetPoint("LEFT", _G["HelloStockByCharCheckText"] or byCharCheck, "RIGHT", 6, 0)
+
+-- "By margin" toggle. Visible only in the To-craft by-character view.
+-- When on, items within each character bucket sort by margin desc so the
+-- most lucrative crafts surface first.
+local byMarginCheck = MakeFilterCheck("HelloStockByMarginCheck", "By margin", byCharCheck, function(self)
+  craftByMargin = self:GetChecked() and true or false
+  SaveFilters()
+  UI:Refresh()
+end)
+byMarginCheck:ClearAllPoints()
+byMarginCheck:SetPoint("LEFT", _G["HelloStockCraftableCheckText"] or craftableCheck, "RIGHT", 6, 0)
 
 -- Class filter dropdown. Filters items that carry a `classes` field (mostly
 -- consumables); items without the field show regardless of selection.
@@ -727,6 +761,19 @@ local function MakeRow(i)
   row.gatherCount:SetJustifyH("RIGHT")
   row.gatherCount:Hide()
 
+  -- "Margin" column for the by-character craft view (gold per craft, or
+  -- "+5g/cd" for cooldown items). SetWordWrap(false) prevents long
+  -- margins like "−200g/cd" from breaking onto a second row and
+  -- visually overlapping the next item's icon/name. The compact
+  -- formatter in the render path keeps most values inside the 56px
+  -- width so we don't get noticeable truncation either.
+  row.gatherMargin = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+  row.gatherMargin:SetPoint("RIGHT", row, "RIGHT", -16, 0)
+  row.gatherMargin:SetWidth(56)
+  row.gatherMargin:SetJustifyH("RIGHT")
+  row.gatherMargin:SetWordWrap(false)
+  row.gatherMargin:Hide()
+
   -- Columns used only by the "By zone" view (gather tab in zones mode).
   -- Five right-aligned numeric columns, evenly spaced 42px apart:
   --   Need / Drop % / Per node / Per hr / Hours.
@@ -741,13 +788,16 @@ local function MakeRow(i)
     fs:SetWidth(42); fs:SetJustifyH("RIGHT"); fs:Hide()
     return fs
   end
-  -- Five columns, 42px wide. Most gaps are 6px; the Drop%-to-Per node gap
+  -- Six columns, 42px wide. Most gaps are 6px; the Drop%-to-Per node gap
   -- is widened to 18px so the wider "Per node" header label doesn't crowd
-  -- "Drop %" on the left.
-  row.bzNeed  = _bzCol(-218)
-  row.bzDrop  = _bzCol(-170)
-  row.bzYield = _bzCol(-110)
-  row.bzRate  = _bzCol(-62)
+  -- "Drop %" on the left. bzGold is the Auctionator-driven gold-per-hour
+  -- column — sits between Per hr and Hours so the gold value reads
+  -- directly off the items-per-hour rate next to it.
+  row.bzNeed  = _bzCol(-266)
+  row.bzDrop  = _bzCol(-218)
+  row.bzYield = _bzCol(-158)
+  row.bzRate  = _bzCol(-110)
+  row.bzGold  = _bzCol(-62)
   row.bzHours = _bzCol(-14)
 
   -- Hover overlays on the three craft-view numbers. Each shows a tooltip with
@@ -1025,7 +1075,24 @@ local function MakeHeader(i)
   h.arrow:SetPoint("LEFT", 2, 0)
   h.text = h:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
   h.text:SetPoint("LEFT", h.arrow, "RIGHT", 4, 0)
+  h.text:SetJustifyH("LEFT")
+  h.text:SetWordWrap(false)
   h.text:SetTextColor(1, 0.82, 0)
+
+  -- Level-range badge ("(50-60)") rendered separately from the zone
+  -- title so the level always shows even when the zone name is long
+  -- and has to truncate. Smaller font + RIGHT-anchored at the column
+  -- boundary; h.text's RIGHT anchors to this element's LEFT so the
+  -- two never overlap. Empty for views that don't have a level
+  -- (Characters, regular tabs, by-character) — empty FontString is
+  -- 0px wide so h.text gets the full available area.
+  h.levelText = h:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+  h.levelText:SetPoint("RIGHT", h, "RIGHT", -300, 0)
+  h.levelText:SetJustifyH("RIGHT")
+  h.levelText:SetTextColor(0.7, 0.7, 0.7)
+  h.levelText:SetText("")
+
+  h.text:SetPoint("RIGHT", h.levelText, "LEFT", -4, 0)
 
   h.stockLabel = h:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
   h.stockLabel:SetPoint("RIGHT", h, "RIGHT", -76, 0)
@@ -1044,6 +1111,15 @@ local function MakeHeader(i)
   h.targetLabel:SetText("Target")
   h.targetLabel:SetTextColor(0.85, 0.75, 0.5)
 
+  -- "Margin" header for the by-character craft view. Hidden by default;
+  -- the by-character render re-anchors it and shows it alongside the
+  -- shifted Need/Stock/Craft labels.
+  h.marginLabel = h:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  h.marginLabel:SetPoint("RIGHT", h, "RIGHT", -16, 0)
+  h.marginLabel:SetText("Margin")
+  h.marginLabel:SetTextColor(0.85, 0.75, 0.5)
+  h.marginLabel:Hide()
+
   -- Column labels for the "By zone" view, matching the bz* columns in
   -- MakeRow. Hidden by default; shown only when the byzone renderer
   -- explicitly enables them.
@@ -1053,10 +1129,11 @@ local function MakeHeader(i)
     fs:SetText(text); fs:SetTextColor(0.85, 0.75, 0.5); fs:Hide()
     return fs
   end
-  h.bzNeedLabel  = _bzLabel(-218, "Need")
-  h.bzDropLabel  = _bzLabel(-170, "Drop %")
-  h.bzYieldLabel = _bzLabel(-110, "Per node")
-  h.bzRateLabel  = _bzLabel(-62,  "Per hr")
+  h.bzNeedLabel  = _bzLabel(-266, "Need")
+  h.bzDropLabel  = _bzLabel(-218, "Drop %")
+  h.bzYieldLabel = _bzLabel(-158, "Per node")
+  h.bzRateLabel  = _bzLabel(-110, "Per hr")
+  h.bzGoldLabel  = _bzLabel(-62,  "g/hr")
   h.bzHoursLabel = _bzLabel(-14,  "Hours")
 
   h.line = h:CreateTexture(nil, "BACKGROUND")
@@ -1100,6 +1177,9 @@ local function MakeHeader(i)
       GameTooltip:AddLine(
         "  or 2 dungeon clears/hr — reflects travel + kill + pickup time",
         0.7, 0.7, 0.7, true)
+      GameTooltip:AddDoubleLine("g/hr",
+        "Per hr \195\151 typical AH price (needs Auctionator)",
+        0.85, 0.75, 0.5, 1, 1, 1)
       GameTooltip:AddDoubleLine("Hours",
         "ETA to clear this item's deficit at the per hour rate",
         0.85, 0.75, 0.5, 1, 1, 1)
@@ -1422,6 +1502,51 @@ local function RenderFarmTab()
     return ("~%.1f/hr"):format(r)
   end
 
+  -- Compact gold-per-hour for the bzGold column. Returns "—" for <1s, "Xs"
+  -- below a gold, "Xg" up to four digits, "Xk" beyond — column is 42px so
+  -- staying ≤4 chars matters. Returned alongside a numeric value the
+  -- "By gold" sort path can compare.
+  local function fmtGoldPerHour(copper)
+    if not copper or copper < 100 then return "\226\128\148" end
+    if copper < 10000 then
+      return ("%ds"):format(math.floor(copper / 100 + 0.5))
+    end
+    local g = copper / 10000
+    if g >= 10000 then return ("%dkg"):format(math.floor(g / 1000 + 0.5)) end
+    return ("%dg"):format(math.floor(g + 0.5))
+  end
+
+  -- Per-item copper/hour estimate used both for the bzGold cell text and
+  -- for the "By gold" sort. Nil when we have no price (so the sort sinks
+  -- those items to the bottom) and when per_hour is missing.
+  local function copperPerHourFor(info)
+    if not (info.per_hour and info.per_hour > 0) then return nil end
+    if not addon.GetMarketPriceTypical then return nil end
+    local pt = addon:GetMarketPriceTypical(info.id)
+    if not (pt and pt.median) then return nil end
+    return info.per_hour * pt.median
+  end
+
+  -- "By gold" re-sorts: within each zone, items go by g/hr desc; zones
+  -- themselves go by their best-item g/hr desc so the top of the list is
+  -- the most lucrative spot you have an unmet target in. Items with no
+  -- price sink to the bottom.
+  if gatherByGold then
+    for _, zone in ipairs(list) do
+      local best = 0
+      for _, info in ipairs(zone.items) do
+        info._gph = copperPerHourFor(info) or 0
+        if info._gph > best then best = info._gph end
+      end
+      zone._bestGph = best
+      table.sort(zone.items, function(a, b) return (a._gph or 0) > (b._gph or 0) end)
+    end
+    table.sort(list, function(a, b)
+      if a._bestGph ~= b._bestGph then return a._bestGph > b._bestGph end
+      return a.zone < b.zone
+    end)
+  end
+
   local rIdx, hIdx = 0, 0
   for _, zone in ipairs(list) do
     -- Zone header: clickable to collapse, with level range + total expected
@@ -1429,7 +1554,8 @@ local function RenderFarmTab()
     hIdx = hIdx + 1
     local h = MakeHeader(hIdx)
     h.category = zone.zone
-    h.text:SetText(zone.zone .. (zone.levels and ("  (" .. zone.levels .. ")") or ""))
+    h.text:SetText(zone.zone)
+    h.levelText:SetText(zone.levels and ("(" .. zone.levels .. ")") or "")
     -- Tint the zone header by the player's level vs the zone's level range.
     -- _textColor is read by MakeHeader's OnLeave so the natural color is
     -- restored after a hover; reset to nil in the cleanup loop so headers
@@ -1453,6 +1579,7 @@ local function RenderFarmTab()
     h.bzDropLabel:Show()
     h.bzYieldLabel:Show()
     h.bzRateLabel:Show()
+    h.bzGoldLabel:Show()
     h.bzHoursLabel:Show()
     h:ClearAllPoints()
     h:SetPoint("TOPLEFT", 0, -y)
@@ -1527,11 +1654,11 @@ local function RenderFarmTab()
             rateNum = ("%.1f"):format(info.per_hour)
           end
           -- Estimated hours to satisfy this item's deficit alone in this
-          -- zone. Useful as a back-of-envelope ETA — see ComputeFarmList
-          -- for the per_hour model. Integer ≥10, one decimal otherwise.
+          -- zone. Past 10 hours the specific number reads as a commitment
+          -- when it really means "more than a sitting" — cap at "10+".
           local h_est = info.needed / info.per_hour
           if h_est >= 10 then
-            hoursNum = tostring(math.floor(h_est + 0.5))
+            hoursNum = "10+"
           else
             hoursNum = ("%.1f"):format(h_est)
           end
@@ -1539,6 +1666,20 @@ local function RenderFarmTab()
         row.bzRate:SetText(rateNum or "?")
         row.bzRate:SetTextColor(0.55, 0.85, 1)
         row.bzRate:Show()
+
+        -- g/hr column: items per hour × typical AH price. Skipped (—) when
+        -- Auctionator hasn't seen this item; rolling-median price keeps
+        -- single-listing noise from dominating.
+        if info.per_hour and info.per_hour > 0 and addon.GetMarketPriceTypical then
+          local pt = addon:GetMarketPriceTypical(info.id)
+          local copperPerHr = pt and pt.median and (info.per_hour * pt.median) or nil
+          row.bzGold:SetText(fmtGoldPerHour(copperPerHr))
+          row.bzGold:SetTextColor(1, 0.85, 0.4)
+        else
+          row.bzGold:SetText("\226\128\148")
+          row.bzGold:SetTextColor(0.5, 0.5, 0.5)
+        end
+        row.bzGold:Show()
 
         row.bzHours:SetText(hoursNum or "?")
         row.bzHours:SetTextColor(0.85, 0.85, 0.85)
@@ -1581,12 +1722,70 @@ local function RenderCraftByCharacterTab()
           name = char.name,
           isMine = char.isMine,
           isUnknown = char.isUnknown,
+          professions = char.professions,
+          cooldowns = char.cooldowns,
           items = kept,
         }
       end
     end
     list = filtered
   end
+
+  -- Search filter: keep buckets where the character name matches, OR any
+  -- of the bucket's items match. Char-name match keeps the whole bucket
+  -- (useful for "show me everything Brokk can make"); item-name match
+  -- only includes the matching items (so "Mooncloth" doesn't pull in
+  -- the rest of a tailor's recipes alongside the one row the user
+  -- actually wanted). Buckets with no surviving items drop off entirely.
+  if searchQuery ~= "" then
+    local filtered = {}
+    for _, char in ipairs(list) do
+      local nameMatch = char.name:lower():find(searchQuery, 1, true) ~= nil
+      if nameMatch then
+        filtered[#filtered + 1] = char
+      else
+        local kept = {}
+        for _, entry in ipairs(char.items) do
+          local nm = GetItemInfo(entry.id)
+          if nm and nm:lower():find(searchQuery, 1, true) then
+            kept[#kept + 1] = entry
+          end
+        end
+        if #kept > 0 then
+          filtered[#filtered + 1] = {
+            name = char.name,
+            isMine = char.isMine,
+            isUnknown = char.isUnknown,
+            professions = char.professions,
+            cooldowns = char.cooldowns,
+            items = kept,
+          }
+        end
+      end
+    end
+    list = filtered
+  end
+
+  -- "By margin" re-sort: keep the per-character bucket ordering but flip
+  -- the per-item sort from profession→section→count to margin desc. Items
+  -- with no computable margin sink to the bottom so the lucrative crafts
+  -- stay at the top. Profession sub-headers stop making sense after this
+  -- sort, so we suppress them in this mode (see lbl render below).
+  if craftByMargin then
+    for _, char in ipairs(list) do
+      for _, entry in ipairs(char.items) do
+        entry._margin = addon.GetCraftMargin and addon:GetCraftMargin(entry.id) or nil
+      end
+      table.sort(char.items, function(a, b)
+        local am, bm = a._margin, b._margin
+        if am and not bm then return true end
+        if bm and not am then return false end
+        if am and bm and am ~= bm then return am > bm end
+        return a.id < b.id
+      end)
+    end
+  end
+
   local y, rIdx, hIdx, lblIdx = 0, 0, 0, 0
   content.profLabels = content.profLabels or {}
 
@@ -1622,15 +1821,22 @@ local function RenderCraftByCharacterTab()
       and "Interface\\Buttons\\UI-PlusButton-Up"
       or  "Interface\\Buttons\\UI-MinusButton-Up")
     h.arrow:Show()
+    -- Need/Craft/Margin headers. Stock is omitted in this view — the
+    -- "Stock" value is the account-wide pooled count, identical across
+    -- every character row, so it's both redundant with the Stockpile
+    -- tooltip section and confusingly named for a per-character view.
     h.stockLabel:ClearAllPoints()
-    h.stockLabel:SetPoint("RIGHT", h, "RIGHT", -130, 0)
+    h.stockLabel:SetPoint("RIGHT", h, "RIGHT", -144, 0)
     h.stockLabel:SetText("Need")
     h.stockLabel:Show()
-    h.gatherMidLabel:Show()
+    h.gatherMidLabel:Hide()
     h.targetLabel:ClearAllPoints()
-    h.targetLabel:SetPoint("RIGHT", h, "RIGHT", -16, 0)
+    h.targetLabel:SetPoint("RIGHT", h, "RIGHT", -86, 0)
     h.targetLabel:SetText("Craft")
     h.targetLabel:Show()
+    h.marginLabel:ClearAllPoints()
+    h.marginLabel:SetPoint("RIGHT", h, "RIGHT", -16, 0)
+    h.marginLabel:Show()
     h.text:SetText(char.name)
     -- Tint: own characters in gold, peer-account characters in grey, the
     -- "No known crafter" bucket in red so it reads as a problem column.
@@ -1653,10 +1859,22 @@ local function RenderCraftByCharacterTab()
       -- Items are pre-sorted by profession → section → craft count. Emit a
       -- small profession sub-label whenever the profession changes so the
       -- groups read as labeled blocks instead of one undifferentiated list.
+      -- Look up the character's current rank for each profession we're
+      -- about to render so we can append it to the sub-label.
+      local rankFor = {}
+      if char.professions then
+        for _, p in ipairs(char.professions) do
+          if p.name and p.skill and p.skill > 0 then
+            rankFor[p.name] = p.skill
+          end
+        end
+      end
       local lastProf
       for _, entry in ipairs(char.items) do
         local prof = addon:GetProfession(entry.id)
-        if prof ~= lastProf then
+        -- Suppress profession sub-headers when sorting by margin — items
+        -- are no longer profession-grouped so a header would be misleading.
+        if prof ~= lastProf and not craftByMargin then
           lblIdx = lblIdx + 1
           local lbl = content.profLabels[lblIdx]
           if not lbl then
@@ -1664,7 +1882,12 @@ local function RenderCraftByCharacterTab()
             lbl:SetJustifyH("LEFT")
             content.profLabels[lblIdx] = lbl
           end
-          lbl:SetText(prof)
+          local rank = rankFor[prof]
+          if rank then
+            lbl:SetText(prof .. " |cff666666\194\183|r " .. rank)
+          else
+            lbl:SetText(prof)
+          end
           lbl:SetTextColor(0.85, 0.75, 0.5)
           lbl:ClearAllPoints()
           -- Align with the item icon column so the label visually sits
@@ -1686,21 +1909,49 @@ local function RenderCraftByCharacterTab()
         row.icon:SetPoint("LEFT", 4, 0)
         row.name:Show()
         row.name:SetAlpha(1)
-        row.name:SetText(name or ("Item " .. entry.id))
+        -- Append "ready in 1d 4h" when this character still has a cooldown
+        -- on this recipe (transmutes, Mooncloth). Same character can craft
+        -- non-cooldown recipes freely, so the badge is per row, not per
+        -- bucket.
+        local nameText = name or ("Item " .. entry.id)
+        local readyAt = char.cooldowns and char.cooldowns[entry.id]
+        if readyAt and readyAt > time() then
+          local note = addon:FormatCooldown(readyAt - time())
+          if note then
+            nameText = nameText .. " |cffaa7777\194\183 " .. note .. "|r"
+          end
+        end
+        row.name:SetText(nameText)
         row.name:SetTextColor(1, 1, 1)
         row.count:Hide()
         if row.targetBox then row.targetBox:Hide() end
+        -- Need / Craft / Margin layout; Stock is omitted in this view.
+        row.gatherNeed:ClearAllPoints()
+        row.gatherNeed:SetPoint("RIGHT", row, "RIGHT", -144, 0)
         row.gatherNeed:Show()
         row.gatherNeed:SetText(tostring(entry.needed))
         row.gatherNeed:SetTextColor(1, 0.82, 0)
-        row.gatherStock:Show()
-        row.gatherStock:SetText(tostring(entry.have))
-        row.gatherStock:SetTextColor(1, 1, 1)
+        row.gatherStock:Hide()
+        row.gatherCount:ClearAllPoints()
+        row.gatherCount:SetPoint("RIGHT", row, "RIGHT", -86, 0)
         row.gatherCount:Show()
         row.gatherCount:SetText(tostring(entry.craft))
         row.gatherCount:SetTextColor(1, 0.3, 0.3)
+        -- Margin column. Uses the shared FormatMargin helper so this and
+        -- the tooltip's "Craft margin" line render identically. Skipped
+        -- (—) when any leaf ingredient is unpriced — false zeros mislead.
+        local margin = addon.GetCraftMargin and addon:GetCraftMargin(entry.id) or nil
+        local text, r, g, b = addon:FormatMargin(margin, addon:HasCooldown(entry.id))
+        if text then
+          row.gatherMargin:SetText(text)
+          row.gatherMargin:SetTextColor(r, g, b)
+        else
+          row.gatherMargin:SetText("\226\128\148")
+          row.gatherMargin:SetTextColor(0.5, 0.5, 0.5)
+        end
+        row.gatherMargin:Show()
         if row.needHover  then row.needHover.qty  = entry.needed; row.needHover:Show()  end
-        if row.stockHover then row.stockHover.qty = entry.have;   row.stockHover:Show() end
+        if row.stockHover then row.stockHover:Hide() end  -- no Stock column in this view
         if row.craftHover then row.craftHover.qty = entry.craft;  row.craftHover:Show() end
         row.boundLock:SetShown(addon:IsBoP(entry.id))
         if entry.craftLevel == "full" then
@@ -1808,7 +2059,24 @@ function UI:Refresh()
     if r.bzDrop  then r.bzDrop:Hide()  end
     if r.bzYield then r.bzYield:Hide() end
     if r.bzRate  then r.bzRate:Hide()  end
+    if r.bzGold  then r.bzGold:Hide()  end
     if r.bzHours then r.bzHours:Hide() end
+    if r.gatherMargin then r.gatherMargin:Hide() end
+    -- The by-character view re-anchors gatherNeed/Stock/Count to make
+    -- room for the Margin column. Reset them to default positions here
+    -- so a subsequent per-item gather render doesn't inherit the shift.
+    if r.gatherNeed then
+      r.gatherNeed:ClearAllPoints()
+      r.gatherNeed:SetPoint("RIGHT", r, "RIGHT", -130, 0)
+    end
+    if r.gatherStock then
+      r.gatherStock:ClearAllPoints()
+      r.gatherStock:SetPoint("RIGHT", r, "RIGHT", -73, 0)
+    end
+    if r.gatherCount then
+      r.gatherCount:ClearAllPoints()
+      r.gatherCount:SetPoint("RIGHT", r, "RIGHT", -16, 0)
+    end
   end
   for _, r in ipairs(charRowPool) do r:Hide() end
   for _, h in ipairs(headerPool)  do
@@ -1817,7 +2085,21 @@ function UI:Refresh()
     if h.bzDropLabel  then h.bzDropLabel:Hide()  end
     if h.bzYieldLabel then h.bzYieldLabel:Hide() end
     if h.bzRateLabel  then h.bzRateLabel:Hide()  end
+    if h.bzGoldLabel  then h.bzGoldLabel:Hide()  end
     if h.bzHoursLabel then h.bzHoursLabel:Hide() end
+    if h.marginLabel  then h.marginLabel:Hide()  end
+    -- gatherMidLabel is the only header label NOT universally re-anchored
+    -- by every consuming view (per-item gather just Show()s it), so reset
+    -- its anchor here in case the by-character view's -133 shift would
+    -- otherwise leak into the next render.
+    if h.gatherMidLabel then
+      h.gatherMidLabel:ClearAllPoints()
+      h.gatherMidLabel:SetPoint("RIGHT", h, "RIGHT", -73, 0)
+    end
+    -- Clear the level-range badge so a header pooled from a previous
+    -- by-zone render doesn't carry "(50-60)" into a Characters / by-
+    -- character / regular-tab render where there's no level concept.
+    if h.levelText then h.levelText:SetText("") end
     -- Clear any level-tint left over from the byzone view so headers reused
     -- on regular tabs restore to the default gold via MakeHeader's OnLeave.
     h._textColor = nil
@@ -1843,8 +2125,12 @@ function UI:Refresh()
   craftableCheck:SetShown(currentTab == "To craft")
   byZoneCheck:SetShown(currentTab == "To gather")
   byZoneCheck:SetChecked(gatherByZone)
+  byGoldCheck:SetShown(currentTab == "To gather" and gatherByZone)
+  byGoldCheck:SetChecked(gatherByGold)
   byCharCheck:SetShown(currentTab == "To craft")
   byCharCheck:SetChecked(craftByCharacter)
+  byMarginCheck:SetShown(currentTab == "To craft" and craftByCharacter)
+  byMarginCheck:SetChecked(craftByMargin)
   ApplyClassWidgetVisibility()
 
   if currentTab == "To gather" then

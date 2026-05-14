@@ -5,11 +5,13 @@
 ## Version: @project-version@
 ## SavedVariables: HelloStockDB
 ## SavedVariablesPerCharacter: HelloStockCharDB
+## OptionalDeps: Auctionator
 ## X-Curse-Project-ID: 1540866
 
 Items.lua
 Comm.lua
 Core.lua
+Prices.lua
 Tooltip.lua
 UI.lua
 Minimap.lua

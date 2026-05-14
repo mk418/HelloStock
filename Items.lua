@@ -51,6 +51,7 @@ addon.ITEMS = {
         { kind = "herb", zone = "Un'Goro Crater", levels = "48-55", spawn_count = 158, avg_yield = 1.59, respawn = 389 },
         { kind = "herb", zone = "Felwood", levels = "48-55", spawn_count = 158, avg_yield = 1.59, respawn = 389 },
         { kind = "herb", zone = "Azshara", levels = "45-55", spawn_count = 158, avg_yield = 1.59, respawn = 389 },
+        { kind = "herb", zone = "Dire Maul (East)", levels = "55-60", spawn_count = 8, avg_yield = 1.59, respawn = 7200 },
         { kind = "vendor", zone = "Lhara (Elwynn Forest / Mulgore)" },
       }},
       { id = 8846,  name = "Gromsblood", sources = {
@@ -58,18 +59,22 @@ addon.ITEMS = {
         { kind = "herb", zone = "Blasted Lands", levels = "45-55", spawn_count = 20, avg_yield = 2.0, respawn = 515 },
         { kind = "herb", zone = "Desolace", levels = "30-40", spawn_count = 20, avg_yield = 2.0, respawn = 515 },
         { kind = "herb", zone = "Ashenvale", levels = "18-30", spawn_count = 20, avg_yield = 2.0, respawn = 515 },
+        { kind = "herb", zone = "Dire Maul (East)", levels = "55-60", spawn_count = 3, avg_yield = 2.0, respawn = 7200 },
         { kind = "vendor", zone = "Vi'el (Winterspring)" },
       }},
       { id = 8845,  name = "Ghost Mushroom", sources = {
         { kind = "herb", zone = "Alterac Valley", levels = "51-60", spawn_count = 12, avg_yield = 2.0, respawn = 300 },
         { kind = "herb", zone = "The Hinterlands", levels = "40-50", spawn_count = 12, avg_yield = 2.0, respawn = 300 },
         { kind = "herb", zone = "Desolace", levels = "30-40", spawn_count = 12, avg_yield = 2.0, respawn = 300 },
+        { kind = "herb", zone = "Maraudon", levels = "40-50", spawn_count = 8, avg_yield = 2.0, respawn = 7200 },
+        { kind = "herb", zone = "Dire Maul", levels = "55-60", spawn_count = 4, avg_yield = 2.0, respawn = 7200 },
         { kind = "vendor", zone = "Lhara (Elwynn Forest / Mulgore)" },
       }},
       { id = 8839,  name = "Blindweed", sources = {
         { kind = "herb", zone = "Alterac Valley", levels = "51-60", spawn_count = 92, avg_yield = 1.31, respawn = 408 },
         { kind = "herb", zone = "Un'Goro Crater", levels = "48-55", spawn_count = 92, avg_yield = 1.31, respawn = 408 },
         { kind = "herb", zone = "Swamp of Sorrows", levels = "35-45", spawn_count = 92, avg_yield = 1.31, respawn = 408 },
+        { kind = "herb", zone = "Maraudon", levels = "40-50", spawn_count = 4, avg_yield = 1.31, respawn = 7200 },
       }},
       { id = 8838,  name = "Sungrass", sources = {
         { kind = "herb", zone = "Zul'Gurub", levels = "60", spawn_count = 7, avg_yield = 1.58, respawn = 259200 },
@@ -117,6 +122,7 @@ addon.ITEMS = {
         { kind = "herb", zone = "Dustwallow Marsh", levels = "35-45", spawn_count = 202, avg_yield = 0.88, respawn = 471 },
         { kind = "herb", zone = "Stranglethorn Vale", levels = "30-45", spawn_count = 202, avg_yield = 0.88, respawn = 471 },
         { kind = "herb", zone = "Alterac Mountains", levels = "30-40", spawn_count = 202, avg_yield = 0.88, respawn = 471 },
+        { kind = "herb", zone = "Scarlet Monastery (Library)", levels = "32-42", spawn_count = 1, avg_yield = 0.88, respawn = 7200 },
         { kind = "mob", zone = "Stranglethorn Vale", levels = "30-45", spawn_count = 23, avg_chance = 10.6, respawn = 300, per_hour = 29.2,
           mobs = { { name = "Kurzen Medicine Man", chance = 10.6 } } },
       }},
@@ -124,6 +130,7 @@ addon.ITEMS = {
         { kind = "herb", zone = "Dustwallow Marsh", levels = "35-45", spawn_count = 238, avg_yield = 1.05, respawn = 451 },
         { kind = "herb", zone = "Swamp of Sorrows", levels = "35-45", spawn_count = 238, avg_yield = 1.05, respawn = 451 },
         { kind = "herb", zone = "Stranglethorn Vale", levels = "30-45", spawn_count = 238, avg_yield = 1.05, respawn = 451 },
+        { kind = "herb", zone = "Scarlet Monastery (Cathedral)", levels = "36-45", spawn_count = 1, avg_yield = 1.05, respawn = 7200 },
         { kind = "dungeon", zone = "Zul'Farrak", levels = "40-50", spawn_count = 1, avg_chance = 66.7, respawn = 86400,
           mobs = { { name = "Weegli Blastfuse", chance = 66.7 } } },
         { kind = "mob", zone = "Stranglethorn Vale", levels = "30-45", spawn_count = 23, avg_chance = 10.3, respawn = 300, per_hour = 28.3,
@@ -140,6 +147,7 @@ addon.ITEMS = {
         { kind = "herb", zone = "Desolace", levels = "30-40", spawn_count = 35, avg_yield = 2.0, respawn = 300 },
         { kind = "herb", zone = "Wetlands", levels = "20-30", spawn_count = 35, avg_yield = 2.0, respawn = 300 },
         { kind = "herb", zone = "Duskwood", levels = "18-30", spawn_count = 35, avg_yield = 2.0, respawn = 300 },
+        { kind = "herb", zone = "Scarlet Monastery (Graveyard)", levels = "28-38", spawn_count = 2, avg_yield = 2.0, respawn = 7200 },
       }},
       { id = 3355,  name = "Wild Steelbloom", sources = {
         { kind = "herb", zone = "Stranglethorn Vale", levels = "30-45", spawn_count = 298, avg_yield = 1.18, respawn = 423 },
@@ -219,7 +227,7 @@ addon.ITEMS = {
       }},
     }},
     { category = "Ores & Bars", items = {
-      { id = 12360, name = "Arcanite Bar", recipe = {
+      { id = 12360, name = "Arcanite Bar", hasCooldown = true, recipe = {
         -- Alchemy transmute (4-day cooldown). One cast yields one bar.
         { id = 12363, count = 1 },  -- Arcane Crystal
         { id = 12359, count = 1 },  -- Thorium Bar
@@ -248,6 +256,7 @@ addon.ITEMS = {
         { kind = "mine", zone = "Alterac Valley", levels = "51-60", spawn_count = 28, avg_yield = 1.0, respawn = 300 },
         { kind = "mine", zone = "Burning Steppes", levels = "50-58", spawn_count = 28, avg_yield = 1.0, respawn = 300 },
         { kind = "mine", zone = "Searing Gorge", levels = "43-52", spawn_count = 28, avg_yield = 1.0, respawn = 300 },
+        { kind = "mine", zone = "Blackrock Depths", levels = "52-60", spawn_count = 6, avg_yield = 1.0, respawn = 7200 },
         { kind = "dungeon", zone = "Blackrock Depths", levels = "52-60", spawn_count = 34, avg_chance = 15.9, respawn = 7200, per_hour = 2.7,
           mobs = { { name = "Warbringer Construct", chance = 17.0 }, { name = "Ragereaver Golem", chance = 16.1 }, { name = "Wrath Hammer Construct", chance = 15.6 } } },
       }},
@@ -292,6 +301,8 @@ addon.ITEMS = {
         { kind = "mine", zone = "Tanaris", levels = "40-50", spawn_count = 132, avg_yield = 0.61, respawn = 418 },
         { kind = "mine", zone = "Feralas", levels = "40-50", spawn_count = 132, avg_yield = 0.61, respawn = 418 },
         { kind = "mine", zone = "Thousand Needles", levels = "25-35", spawn_count = 132, avg_yield = 0.61, respawn = 418 },
+        { kind = "mine", zone = "Uldaman", levels = "35-45", spawn_count = 2, avg_yield = 0.61, respawn = 7200 },
+        { kind = "mine", zone = "Maraudon", levels = "40-50", spawn_count = 6, avg_yield = 0.61, respawn = 7200 },
       }},
       { id = 3577,  name = "Gold Bar", recipe = {
         { id = 2776,  count = 1 },  -- Gold Ore
@@ -312,6 +323,7 @@ addon.ITEMS = {
         { kind = "mine", zone = "Stranglethorn Vale", levels = "30-45", spawn_count = 465, avg_yield = 0.71, respawn = 388 },
         { kind = "mine", zone = "Arathi Highlands", levels = "30-40", spawn_count = 465, avg_yield = 0.71, respawn = 388 },
         { kind = "mine", zone = "Desolace", levels = "30-40", spawn_count = 465, avg_yield = 0.71, respawn = 388 },
+        { kind = "mine", zone = "Uldaman", levels = "35-45", spawn_count = 2, avg_yield = 0.71, respawn = 7200 },
       }},
       { id = 2841,  name = "Bronze Bar", recipe = {
         -- Bronze is the only smelt that consumes bars (not ore): one
@@ -637,9 +649,11 @@ addon.ITEMS = {
       }},
     }},
     { category = "Cloth", items = {
-      { id = 14342, name = "Mooncloth", sources = {
+      { id = 14342, name = "Mooncloth", hasCooldown = true, recipe = {
         -- Tailoring transmute: 2 Felcloth at a Moonwell, 4-day cooldown,
         -- requires the Mooncloth Tailoring book (Felcloth turn-in quest).
+        { id = 14256, count = 2 },  -- Felcloth
+      }, sources = {
         { kind = "craft", zone = "Tailoring transmute (2 Felcloth, 4-day CD at a Moonwell)" },
       }},
       { id = 14256, name = "Felcloth", sources = {

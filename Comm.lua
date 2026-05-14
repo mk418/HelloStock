@@ -111,6 +111,32 @@ local function DecodeProfessions(s)
   return out
 end
 
+-- Cooldown table: "itemID:readyAt,itemID:readyAt". readyAt is a Unix epoch
+-- (time() at the moment of capture + remaining cd). Encoder strips entries
+-- that have already expired so receivers don't bother allocating slots for
+-- past cooldowns. Empty table → empty string → field omitted on receive.
+local function EncodeCooldowns(t)
+  if not t then return "" end
+  local now = time()
+  local parts = {}
+  for id, readyAt in pairs(t) do
+    if readyAt and readyAt > now then
+      parts[#parts + 1] = id .. ":" .. readyAt
+    end
+  end
+  return table.concat(parts, ",")
+end
+
+local function DecodeCooldowns(s)
+  local out = {}
+  if not s or s == "" then return out end
+  for entry in s:gmatch("[^,]+") do
+    local id, readyAt = entry:match("^(%d+):(%d+)$")
+    if id then out[tonumber(id)] = tonumber(readyAt) end
+  end
+  return out
+end
+
 -- Gold outbox: "copper:sentAt:to" triples. Parallel to EncodeOutbox; same
 -- shape minus the itemID, so peers can run the same recipient-aware prune.
 local function EncodeMoneyOutbox(list)
@@ -155,6 +181,7 @@ local function BuildPayload(c)
     "mout=" .. EncodeMoneyOutbox(c.moneyOutbox),
     "ots="  .. (c.outboxUpdated or 0),
     "crft=" .. EncodeIDs(c.crafts),
+    "cd="   .. EncodeCooldowns(c.cooldowns),
     "mny="  .. (c.money or 0),
     "cls="  .. (c.class or ""),
     "lvl="  .. (c.level or 0),
@@ -444,6 +471,7 @@ local function HandleSnapshot(buf, senderHash)
     moneyOutbox   = fields.mout and DecodeMoneyOutbox(fields.mout) or nil,
     outboxUpdated = tonumber(fields.ots) or 0,
     crafts        = DecodeIDs(fields.crft),
+    cooldowns     = fields.cd and DecodeCooldowns(fields.cd) or nil,
     money         = tonumber(fields.mny) or 0,
     class         = (fields.cls ~= "" and fields.cls) or nil,
     level         = tonumber(fields.lvl),

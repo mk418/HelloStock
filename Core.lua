@@ -641,8 +641,10 @@ end
 --   Open-world (respawn < 10min): capped at 60 kills/hr for mobs and
 --   30 gathers/hr for nodes — travel/kill/pickup dominate over raw spawn
 --   density, so the per-hour ceilings reflect realistic solo farming.
---   Dungeon (respawn >= 10min, instance reset): assume 2 clears/hour, with
---   per-clear yield = spawn_count × chance% (mob) or × yield (node).
+--   Dungeon (respawn >= 10min, instance reset): 2 clears/hour with
+--   per-clear yield = spawn_count × chance% (mob) or × yield (node),
+--   then capped at half the open-world ceiling — dungeon mobs are mostly
+--   elites, so solo kill rate is roughly half open-world.
 --
 -- Returns list sorted by score desc:
 --   { { zone, levels, score, items = { { id, needed, expected, capped,
@@ -651,24 +653,30 @@ end
 local FARM_OPENWORLD_MOB_PER_HOUR  = 60   -- ceiling: 1 kill / minute
 local FARM_OPENWORLD_NODE_PER_HOUR = 30   -- ceiling: 1 gather / 2 minutes
 local FARM_DUNGEON_CLEARS_PER_HOUR = 2    -- one clear every 30 min
+local FARM_DUNGEON_MOB_PER_HOUR    = 30   -- elites: 1 kill / 2 minutes
+local FARM_DUNGEON_NODE_PER_HOUR   = 15   -- 1 gather / 4 minutes inside instances
 
 local function FarmYieldPerHour(s)
   if not s.spawn_count then return nil end
   local isInstance = (s.respawn and s.respawn >= 600)
   if s.kind == "mob" or s.kind == "dungeon" then
     if not s.avg_chance then return nil end
-    local perClear = s.spawn_count * s.avg_chance / 100
     if isInstance then
-      return perClear * FARM_DUNGEON_CLEARS_PER_HOUR
+      local effSpawns = math.min(
+        s.spawn_count * FARM_DUNGEON_CLEARS_PER_HOUR,
+        FARM_DUNGEON_MOB_PER_HOUR)
+      return effSpawns * s.avg_chance / 100
     end
     -- Open-world: cap killable mobs/hour at the ceiling.
     local effSpawns = math.min(s.spawn_count, FARM_OPENWORLD_MOB_PER_HOUR)
     return effSpawns * s.avg_chance / 100
   elseif s.kind == "herb" or s.kind == "mine" or s.kind == "skin" then
     if not s.avg_yield then return nil end
-    local perClear = s.spawn_count * s.avg_yield
     if isInstance then
-      return perClear * FARM_DUNGEON_CLEARS_PER_HOUR
+      local effSpawns = math.min(
+        s.spawn_count * FARM_DUNGEON_CLEARS_PER_HOUR,
+        FARM_DUNGEON_NODE_PER_HOUR)
+      return effSpawns * s.avg_yield
     end
     local effSpawns = math.min(s.spawn_count, FARM_OPENWORLD_NODE_PER_HOUR)
     return effSpawns * s.avg_yield

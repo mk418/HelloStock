@@ -1350,7 +1350,8 @@ addon.ITEMS = {
         { id = 8925,  count = 1 },  -- Crystal Vial
       } },
       { id = 9088,  name = "Gift of Arthas", recipe = {
-        { id = 8839, count = 3 },  -- Blindweed
+        { id = 8836, count = 1 },  -- Arthas' Tears
+        { id = 8839, count = 1 },  -- Blindweed
         { id = 8925, count = 1 },  -- Crystal Vial
       } },
       { id = 20007, name = "Mageblood Potion", classes = MANA, recipe = {

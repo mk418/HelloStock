@@ -867,6 +867,12 @@ end
 local function MarkCooldown(itemID, readyAt)
   if not itemID or not addon:IsTracked(itemID) then return false end
   if not readyAt or readyAt <= time() then return false end
+  -- GetTradeSkillCooldown can return fractional seconds, which leaks
+  -- sub-second precision into readyAt. That breaks two things: the wire
+  -- format (DecodeCooldowns only matches integers, so peers drop the
+  -- entry) and the FireCooldownReady guard (a fractional readyAt can
+  -- sit just above an integer time(), suppressing the alert).
+  readyAt = math.floor(readyAt)
   local c = addon:GetSelf()
   if not c then return false end
   c.cooldowns = c.cooldowns or {}
@@ -896,7 +902,11 @@ local function FireCooldownReady(charKey, itemID)
             and HelloStockDB.characters[charKey]
   if not c or not c.cooldowns then return end
   local readyAt = c.cooldowns[itemID]
-  if not readyAt or readyAt > time() then return end  -- rescheduled meanwhile
+  -- Suppress only if a legitimate reschedule pushed the entry materially
+  -- into the future. C_Timer can fire a frame early (sub-second), and a
+  -- strict readyAt > time() check would then silently swallow the alert
+  -- and leave the cooldown entry stuck in the DB.
+  if not readyAt or readyAt - time() > 30 then return end
   c.cooldowns[itemID] = nil
   local itemName = GetItemInfo(itemID) or ("Item " .. itemID)
   print(("|cffffd200[HelloStock]|r %s's %s cooldown is ready."):format(

@@ -131,8 +131,14 @@ local function DecodeCooldowns(s)
   local out = {}
   if not s or s == "" then return out end
   for entry in s:gmatch("[^,]+") do
-    local id, readyAt = entry:match("^(%d+):(%d+)$")
-    if id then out[tonumber(id)] = tonumber(readyAt) end
+    -- readyAt is normally an integer epoch second, but older peers may
+    -- have transmitted fractional values from GetTradeSkillCooldown. Be
+    -- tolerant on receive and floor to integer, otherwise the strict
+    -- "^(%d+):(%d+)$" form would silently drop those entries.
+    local id, readyAt = entry:match("^(%d+):([%d%.]+)$")
+    if id and readyAt then
+      out[tonumber(id)] = math.floor(tonumber(readyAt))
+    end
   end
   return out
 end
